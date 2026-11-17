@@ -1,174 +1,132 @@
 import { getCollection } from './mongo'
-import type {
-  MahjongGame,
-  StoredTile,
-  StoredMeld,
-  GamePlayer,
-  GameAction as StoredGameAction
-} from '../types/database'
-import {
-  TileSuit,
-  type GameState,
-  type Player,
-  type Tile,
-  type Meld,
-  type GameAction,
-  type PendingAction
-} from '../types/game'
+import { GamePhase, type GameState } from '../../shared/types/game'
 
 const COLLECTION_NAME = 'mahjongGames'
 
-type PersistedMahjongGame = MahjongGame & { pendingActions?: PendingAction[] }
-
-const tileToStored = (tile: Tile): StoredTile => ({
-  suit: tile.suit,
-  value: tile.value,
-  id: tile.id
-})
-
-const storedToTile = (tile: StoredTile): Tile => ({
-  suit: tile.suit as TileSuit,
-  value: tile.value,
-  id: tile.id
-})
-
-const meldToStored = (meld: Meld): StoredMeld => ({
-  type: meld.type,
-  tiles: meld.tiles.map(tileToStored),
-  isConcealed: meld.isConcealed
-})
-
-const storedToMeld = (meld: StoredMeld): Meld => ({
-  type: meld.type,
-  tiles: meld.tiles.map(storedToTile),
-  isConcealed: meld.isConcealed
-})
-
-const playerToStored = (player: Player): GamePlayer => ({
-  userId: player.id,
-  name: player.name,
-  position: player.position,
-  hand: {
-    concealedTiles: player.hand.concealedTiles.map(tileToStored),
-    exposedMelds: player.hand.exposedMelds.map(meldToStored),
-    discardedTiles: player.hand.discardedTiles.map(tileToStored)
-  },
-  status: player.status,
-  isDealer: player.isDealer,
-  isTing: player.isTing,
-  missingSuit: player.missingSuit,
-  windScore: player.windScore,
-  rainScore: player.rainScore,
-  wonFan: player.wonFan,
-  winOrder: player.winOrder,
-  winRound: player.winRound,
-  winTimestamp: player.winTimestamp,
-  score: player.score
-})
-
-const storedToPlayer = (player: GamePlayer): Player => ({
-  id: player.userId,
-  name: player.name,
-  position: player.position,
-  hand: {
-    concealedTiles: player.hand.concealedTiles.map(storedToTile),
-    exposedMelds: player.hand.exposedMelds.map(storedToMeld),
-    discardedTiles: player.hand.discardedTiles.map(storedToTile)
-  },
-  status: player.status,
-  isDealer: player.isDealer,
-  isTing: player.isTing,
-  missingSuit: player.missingSuit ?? null,
-  windScore: player.windScore,
-  rainScore: player.rainScore,
-  wonFan: player.wonFan,
-  winOrder: player.winOrder ?? null,
-  winRound: player.winRound ?? null,
-  winTimestamp: player.winTimestamp ?? null,
-  score: player.score ?? 0
-})
-
-const actionToStored = (action: GameAction): StoredGameAction => ({
-  playerId: action.playerId,
-  type: action.type,
-  tile: action.tile ? tileToStored(action.tile) : undefined,
-  tiles: action.tiles ? action.tiles.map(tileToStored) : undefined,
-  timestamp: action.timestamp
-})
-
-const storedToAction = (action: StoredGameAction): GameAction => ({
-  playerId: action.playerId,
-  type: action.type,
-  tile: action.tile ? storedToTile(action.tile) : undefined,
-  tiles: action.tiles ? action.tiles.map(storedToTile) : undefined,
-  timestamp: action.timestamp
-})
-
-const gameStateToDocument = (game: GameState): PersistedMahjongGame => ({
-  gameId: game.gameId,
-  roomId: game.gameId,
-  phase: game.phase as PersistedMahjongGame['phase'],
-  endReason: game.endReason,
-  players: game.players.map(playerToStored),
-  wall: game.wall.map(tileToStored),
-  currentPlayerIndex: game.currentPlayerIndex,
-  dealerIndex: game.dealerIndex,
-  discardPile: game.discardPile.map(tileToStored),
-  actionHistory: game.actionHistory.map(actionToStored),
-  winnersCount: game.winnersCount,
-  roundNumber: game.roundNumber,
-  createdAt: new Date(game.createdAt),
-  lastActionTime: new Date(game.lastActionTime),
-  updatedAt: new Date(),
-  endedAt: game.endedAt ? new Date(game.endedAt) : undefined,
-  finalScores: game.finalScores,
-  customScoringMode: game.customScoringMode ?? null,
-  pendingActions: game.pendingActions
-})
-
-const documentToGameState = (doc: PersistedMahjongGame): GameState => ({
-  gameId: doc.gameId,
-  phase: doc.phase as GameState['phase'],
-  endReason: (doc.endReason ?? null) as GameState['endReason'],
-  players: doc.players.map(storedToPlayer),
-  wall: doc.wall.map(storedToTile),
-  currentPlayerIndex: doc.currentPlayerIndex,
-  dealerIndex: doc.dealerIndex,
-  discardPile: doc.discardPile.map(storedToTile),
-  actionHistory: doc.actionHistory.map(storedToAction),
-  winnersCount: doc.winnersCount,
-  roundNumber: doc.roundNumber,
-  createdAt: doc.createdAt.getTime(),
-  lastActionTime: doc.lastActionTime.getTime(),
-  endedAt: doc.endedAt ? doc.endedAt.getTime() : undefined,
-  finalScores: doc.finalScores,
-  customScoringMode: (doc.customScoringMode ?? null) as GameState['customScoringMode'],
-  pendingActions: doc.pendingActions ?? []
-})
-
-export const saveGameState = async (game: GameState): Promise<void> => {
-  const games = await getCollection<PersistedMahjongGame>(COLLECTION_NAME)
-  const doc = gameStateToDocument(game)
-  await games.updateOne(
-    { gameId: game.gameId },
-    { $set: doc },
-    { upsert: true }
-  )
+/**
+ * Stored shape: the full GameState plus a few denormalised fields for lobby queries.
+ * Dates are kept as epoch numbers inside the state; `updatedAt` is a real Date for sorting.
+ */
+export interface StoredGame extends GameState {
+  playerUserIds: string[]
+  playerCount: number
+  updatedAt: Date
 }
 
-export const loadGameState = async (gameId: string): Promise<GameState | null> => {
-  const games = await getCollection<PersistedMahjongGame>(COLLECTION_NAME)
-  const doc = await games.findOne({ gameId })
-  return doc ? documentToGameState(doc) : null
+export class PersistConflictError extends Error {
+  constructor(public readonly gameId: string) {
+    super('Game state was modified concurrently')
+    this.name = 'PersistConflictError'
+  }
 }
 
-export const deleteGameState = async (gameId: string): Promise<void> => {
-  const games = await getCollection<PersistedMahjongGame>(COLLECTION_NAME)
-  await games.deleteOne({ gameId })
+function toStored(state: GameState): StoredGame {
+  return {
+    ...state,
+    playerUserIds: state.players.map(p => p.userId),
+    playerCount: state.players.length,
+    updatedAt: new Date()
+  }
 }
 
-export const loadAllGameStates = async (): Promise<GameState[]> => {
-  const games = await getCollection<PersistedMahjongGame>(COLLECTION_NAME)
-  const docs = await games.find({}).toArray()
-  return docs.map(documentToGameState)
+function fromStored(doc: any): GameState {
+  const { _id, playerUserIds, playerCount, updatedAt, ...state } = doc
+  // Backfill fields for documents persisted by older versions of the engine.
+  state.rules ??= {}
+  state.sessionScores ??= {}
+  state.ledger ??= []
+  state.handHistory ??= []
+  state.claimWindow ??= null
+  state.exchange ??= null
+  state.lastDiscard ??= null
+  state.lastKong ??= null
+  state.turnDeadline ??= null
+  state.pristine ??= false
+  state.nextDealerId ??= null
+  state.eventSeq ??= 0
+  state.recentEvents ??= []
+  state.version ??= 0
+  state.handNumber ??= state.phase === GamePhase.WAITING ? 0 : 1
+  state.code ??= String(state.gameId).slice(0, 6).toUpperCase()
+  state.hostId ??= state.players?.[0]?.userId ?? ''
+  for (const p of state.players ?? []) {
+    p.userId ??= p.id
+    p.wins ??= []
+    p.sessionScore ??= 0
+    p.handLocked ??= false
+    p.lastDrawnTileId ??= null
+    p.passedHu ??= null
+    p.drawCount ??= 0
+    p.exchangeSubmitted ??= false
+    p.connected ??= false
+    p.lastSeenAt ??= 0
+    p.autoPlay ??= false
+    p.isBot ??= false
+    p.isHost ??= p.userId === state.hostId
+  }
+  return state as GameState
+}
+
+/**
+ * Compare-and-swap save. `expectedVersion` is the version loaded before the mutation;
+ * the caller must already have incremented `state.version`.
+ */
+export async function saveGameState(state: GameState, expectedVersion: number): Promise<void> {
+  const collection = await getCollection<StoredGame>(COLLECTION_NAME)
+  const doc = toStored(state)
+  if (expectedVersion === 0 && state.version === 1) {
+    // First save; tolerate a pre-existing document with the same id (dev HMR) by replacing it.
+    await collection.updateOne({ gameId: state.gameId }, { $set: doc as any }, { upsert: true })
+    return
+  }
+  const result = await collection.updateOne({ gameId: state.gameId, version: expectedVersion }, { $set: doc as any })
+  if (result.matchedCount === 0) {
+    const exists = await collection.countDocuments({ gameId: state.gameId })
+    if (exists === 0) {
+      await collection.insertOne(doc as any)
+      return
+    }
+    throw new PersistConflictError(state.gameId)
+  }
+}
+
+export async function loadGameState(gameId: string): Promise<GameState | null> {
+  const collection = await getCollection<StoredGame>(COLLECTION_NAME)
+  const doc = await collection.findOne({ gameId })
+  return doc ? fromStored(doc) : null
+}
+
+export async function loadGameByCode(code: string): Promise<GameState | null> {
+  const collection = await getCollection<StoredGame>(COLLECTION_NAME)
+  const docs = await collection.find({ code }).sort({ updatedAt: -1 }).limit(5).toArray()
+  // Prefer a live room over an ended one with the same code.
+  const live = docs.find(d => d.phase !== GamePhase.ENDED) ?? docs[0]
+  return live ? fromStored(live) : null
+}
+
+export async function loadActiveGameStates(): Promise<GameState[]> {
+  const collection = await getCollection<StoredGame>(COLLECTION_NAME)
+  const docs = await collection.find({ phase: { $ne: GamePhase.ENDED } }).sort({ updatedAt: -1 }).limit(200).toArray()
+  return docs.map(fromStored)
+}
+
+export async function loadWaitingGameStates(): Promise<GameState[]> {
+  const collection = await getCollection<StoredGame>(COLLECTION_NAME)
+  const docs = await collection.find({ phase: GamePhase.WAITING }).sort({ updatedAt: -1 }).limit(25).toArray()
+  return docs.map(fromStored)
+}
+
+export async function loadGamesForUser(userId: string): Promise<GameState[]> {
+  const collection = await getCollection<StoredGame>(COLLECTION_NAME)
+  const docs = await collection
+    .find({ playerUserIds: userId, phase: { $ne: GamePhase.ENDED } })
+    .sort({ updatedAt: -1 })
+    .limit(10)
+    .toArray()
+  return docs.map(fromStored)
+}
+
+export async function deleteGameState(gameId: string): Promise<void> {
+  const collection = await getCollection<StoredGame>(COLLECTION_NAME)
+  await collection.deleteOne({ gameId })
 }

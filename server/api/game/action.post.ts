@@ -1,85 +1,30 @@
-import { gameManager } from '../../utils/gameManager';
-import { ActionType } from '../../types/game';
-import { emitToRoom } from '../../utils/socket';
-import { requireAdminUser } from '../../utils/session';
+import { ActionType } from '../../../shared/types/game'
+import { gameManager } from '../../utils/gameManager'
+import { seatUserFromEvent, throwHttp } from '../../utils/gameHttp'
+
+/**
+ * REST fallback for game actions (the client normally uses the socket).
+ * Body: { gameId, action | type, tileId?, tileIds?, suit?, asPlayerId? (admin) }
+ */
 
 export default defineEventHandler(async (event) => {
-  const body = await readBody(event);
-  const { gameId, playerId, action, tileId, tileIds } = body;
+  const user = await seatUserFromEvent(event)
+  const body = (await readBody(event).catch(() => ({}))) ?? {}
+  const { gameId, tileId, tileIds, suit, asPlayerId } = body
+  const action = body.action ?? body.type
 
-  if (!gameId || !playerId || !action) {
-    throw createError({
-      statusCode: 400,
-      message: 'Game ID, player ID, and action are required'
-    });
+  if (!gameId || !action) {
+    throw createError({ statusCode: 400, message: 'gameId and action are required' })
   }
-
-  // Validate action type
   if (!Object.values(ActionType).includes(action)) {
-    throw createError({
-      statusCode: 400,
-      message: 'Invalid action type'
-    });
-  }
-
-  if (action === ActionType.CHEAT_HU) {
-    await requireAdminUser(event);
+    throw createError({ statusCode: 400, message: 'Invalid action type' })
   }
 
   try {
-    await gameManager.executeAction(gameId, playerId, action, tileId, tileIds);
-    
-    const game = await gameManager.getGame(gameId);
-    const player = game?.players.find(p => p.id === playerId);
-
-    // Broadcast game state to all players in the room via Socket.IO
-    emitToRoom(gameId, 'game:state-changed', {
-      gameId,
-      currentPlayerIndex: game?.currentPlayerIndex,
-      phase: game?.phase,
-      roundNumber: game?.roundNumber,
-      players: game!.players.map(p => ({
-        id: p.id,
-        name: p.name,
-        position: p.position,
-        discardedTiles: p.hand.discardedTiles,
-        exposedMelds: p.hand.exposedMelds,
-        status: p.status,
-        windScore: p.windScore,
-        rainScore: p.rainScore,
-        score: p.score,
-        handSize: p.hand.concealedTiles.length
-      })),
-      lastAction: {
-        playerId,
-        action,
-        tileId
-      }
-    });
-
-    const availableActions = await gameManager.getAvailableActions(gameId, playerId);
-
-    return {
-      success: true,
-      data: {
-        game: {
-          ...game,
-          players: game!.players.map(p => ({
-            ...p,
-            hand: {
-              ...p.hand,
-              concealedTiles: p.id === playerId ? p.hand.concealedTiles : []
-            }
-          }))
-        },
-        playerView: player?.hand,
-        availableActions
-      }
-    };
-  } catch (error: any) {
-    throw createError({
-      statusCode: 400,
-      message: error.message || 'Failed to execute action'
-    });
+    await gameManager.act(gameId, { userId: user.userId, isAdmin: user.isAdmin, asPlayerId: user.isAdmin ? asPlayerId : undefined }, action, { tileId, tileIds, suit })
+    const game = await gameManager.getGame(gameId)
+    return { success: true, data: game ? gameManager.viewFor(game, user.userId, { isAdmin: user.isAdmin }) : null }
+  } catch (error) {
+    throwHttp(error)
   }
-});
+})

@@ -1,12 +1,10 @@
-// middleware/auth.global.ts
-export default defineNuxtRouteMiddleware((to, from) => {
-  // Allow login page without auth
-  if (to.path === '/login') return
+export default defineNuxtRouteMiddleware((to) => {
+  if (to.path === '/login' || to.path.startsWith('/join/')) return
 
-  const token = useCookie('auth_token').value
-
-  // Not logged in → redirect to login
-  if (!token) {
-    return navigateTo('/login')
+  // The marker cookie mirrors the httpOnly session cookie; the server still verifies every call.
+  const marker = useCookie('auth_token').value
+  if (!marker) {
+    const next = to.fullPath && to.fullPath !== '/' ? `?next=${encodeURIComponent(to.fullPath)}` : ''
+    return navigateTo(`/login${next}`)
   }
 })

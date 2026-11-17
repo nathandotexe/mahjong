@@ -25,3 +25,5 @@ logs
 
 test-results
 playwright-artifacts
+# Vercel CLI / local preset builds
+.vercel

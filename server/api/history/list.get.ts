@@ -1,15 +1,19 @@
-import { MatchHistoryService } from '../../services/matchHistoryService';
+import { MatchHistoryService } from '../../services/matchHistoryService'
+import { optionalUserFromEvent } from '../../utils/session'
 
+/** Recent hands. Query: mine=1 (session user only), limit */
 export default defineEventHandler(async (event) => {
-  const query = getQuery(event);
-  const userId = typeof query.userId === 'string' ? query.userId : undefined;
-  const limitParam = typeof query.limit === 'string' ? parseInt(query.limit, 10) : undefined;
-  const limit = Number.isFinite(limitParam) && limitParam! > 0 ? limitParam : 20;
+  const query = getQuery(event)
+  const limitParam = typeof query.limit === 'string' ? parseInt(query.limit, 10) : undefined
+  const limit = Number.isFinite(limitParam) && limitParam! > 0 ? Math.min(limitParam!, 100) : 20
 
-  const histories = await MatchHistoryService.listMatches({ userId, limit });
+  let userId: string | undefined
+  if (query.mine === '1' || query.mine === 'true') {
+    const user = await optionalUserFromEvent(event)
+    userId = user?.userId
+    if (!userId) return { success: true, data: [] }
+  }
 
-  return {
-    success: true,
-    data: histories
-  };
-});
+  const histories = await MatchHistoryService.listMatches({ userId, limit })
+  return { success: true, data: histories }
+})

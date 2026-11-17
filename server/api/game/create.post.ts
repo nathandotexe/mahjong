@@ -1,27 +1,18 @@
-import { gameManager } from '../../utils/gameManager';
+import { gameManager } from '../../utils/gameManager'
+import { seatUserFromEvent, throwHttp } from '../../utils/gameHttp'
 
+/** Create a room. The session user becomes the host. Body: { rules?: Partial<RuleConfig> } */
 export default defineEventHandler(async (event) => {
-  const body = await readBody(event);
-  const { playerName } = body;
-
-  if (!playerName || typeof playerName !== 'string') {
-    throw createError({
-      statusCode: 400,
-      message: 'Player name is required'
-    });
-  }
-
+  const user = await seatUserFromEvent(event)
+  const body = (await readBody(event).catch(() => ({}))) ?? {}
   try {
-    const result = await gameManager.createGame(playerName);
-    
+    const state = await gameManager.createGame(user, body.rules)
+    const view = gameManager.viewFor(state, user.userId, { isAdmin: user.isAdmin })
     return {
       success: true,
-      data: result
-    };
-  } catch (error: any) {
-    throw createError({
-      statusCode: 500,
-      message: error.message || 'Failed to create game'
-    });
+      data: { gameId: state.gameId, code: state.code, playerId: view.viewerPlayerId, view }
+    }
+  } catch (error) {
+    throwHttp(error)
   }
-});
+})

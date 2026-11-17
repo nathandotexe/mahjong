@@ -1,363 +1,139 @@
 <template>
-  <div class="history-page">
-    <div class="history-shell">
-      <header class="history-header">
-        <button class="ghost-button" @click="goBack">← Back</button>
+  <div class="mj-page history">
+    <div class="mj-card shell">
+      <header class="head">
+        <NuxtLink to="/" class="mj-btn ghost small">← Back</NuxtLink>
         <div>
-          <h1>Match History</h1>
-          <p class="subtitle">Recent games across all rooms</p>
+          <h1 class="mj-title">Match History</h1>
+          <p class="mj-subtitle">Recent games across all rooms</p>
         </div>
-        <button class="ghost-button" @click="loadHistory" :disabled="isLoading">
-          Refresh
-        </button>
+        <button class="mj-btn small" :disabled="isLoading" @click="loadHistory">Refresh</button>
       </header>
 
-      <section class="filter-bar">
-        <label class="toggle">
-          <input type="checkbox" v-model="showOnlyMine" :disabled="!userIdCookie" />
-          <span>Show only my matches</span>
-        </label>
-        <span v-if="!userIdCookie" class="filter-hint">Log in to filter by your games.</span>
-      </section>
+      <label class="filter">
+        <button class="mj-switch" role="switch" :aria-checked="showOnlyMine" @click="showOnlyMine = !showOnlyMine" />
+        <span>Show only my hands</span>
+      </label>
 
-      <section class="history-content">
-        <p v-if="errorMessage" class="error">{{ errorMessage }}</p>
-        <p v-else-if="isLoading" class="loading">Loading match history…</p>
-        <p v-else-if="!histories.length" class="empty">No matches recorded yet.</p>
+      <p v-if="errorMessage" class="mj-error">{{ errorMessage }}</p>
+      <p v-else-if="isLoading" class="muted">Loading match history…</p>
+      <p v-else-if="!histories.length" class="muted">No hands recorded yet.</p>
 
-        <div v-else class="history-list">
-          <article v-for="match in histories" :key="match.gameId" class="history-card">
-            <div class="card-header">
-              <div>
-                <p class="room-label">Room {{ match.roomId }}</p>
-                <h2>{{ formatDate(match.completedAt) }}</h2>
-              </div>
-              <div class="meta">
-                <span class="badge">{{ match.winnersCount }} Winner{{ match.winnersCount === 1 ? '' : 's' }}</span>
-                <span class="badge subtle">Round {{ match.roundNumber }}</span>
-              </div>
+      <div v-else class="list">
+        <article v-for="match in histories" :key="`${match.gameId}-${match.handNumber ?? 0}`" class="match">
+          <div class="match-head">
+            <div>
+              <p class="room">Room {{ match.code ?? match.roomId.slice(0, 6).toUpperCase() }}<span v-if="match.handNumber"> · hand {{ match.handNumber }}</span></p>
+              <h2>{{ formatDate(match.completedAt) }}</h2>
             </div>
+            <div class="meta">
+              <span class="mj-chip gold">{{ match.winnersCount }} winner{{ match.winnersCount === 1 ? '' : 's' }}</span>
+              <span class="mj-chip muted">{{ reasonLabel(match.endReason) }}</span>
+              <span v-if="match.rules" class="mj-chip muted">{{ match.rules.preset === 'mil' ? 'MIL' : 'Standard' }} · cap {{ match.rules.fanCap || '∞' }}</span>
+            </div>
+          </div>
 
-            <ul class="player-list">
-              <li
-                v-for="player in match.results"
-                :key="player.playerId"
-                :class="['player-row', { winner: player.status === 'won', me: player.playerId === userIdCookie }]"
-              >
-                <div>
-                  <p class="player-name">{{ player.name }}</p>
-                  <p class="player-meta">
-                    {{ player.status === 'won' ? 'Winner' : 'Participant' }} · Seat {{ player.position + 1 }}
-                  </p>
-                </div>
-                <div class="player-score" :class="scoreClass(player.finalScore ?? match.finalScores?.[player.playerId] ?? 0)">
-                  {{ formatScore(player.finalScore ?? match.finalScores?.[player.playerId] ?? 0) }}
-                </div>
-              </li>
-            </ul>
-          </article>
-        </div>
-      </section>
+          <ul class="players">
+            <li v-for="player in match.results" :key="player.playerId" :class="{ winner: player.status === 'won', me: player.userId === myUserId }">
+              <div>
+                <p class="pname">{{ player.name }} <span v-if="player.userId === myUserId" class="mj-chip muted">you</span></p>
+                <p class="pmeta">
+                  {{ player.status === 'won' ? `won #${player.winOrder ?? ''}` : 'did not win' }}
+                  <span v-if="player.fanSummary"> · {{ player.fanSummary }}</span>
+                </p>
+              </div>
+              <div class="pscore">
+                <b :class="cls(player.finalScore)">{{ fmt(player.finalScore) }}</b>
+                <small v-if="player.sessionScore !== undefined" :class="cls(player.sessionScore)">session {{ fmt(player.sessionScore) }}</small>
+              </div>
+            </li>
+          </ul>
+        </article>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
-
-interface MatchHistoryResult {
+interface Result {
   playerId: string
+  userId?: string
   name: string
-  position: number
-  status: 'waiting' | 'playing' | 'won' | 'lost'
+  status: string
   winOrder: number | null
-  winRound: number | null
-  winTimestamp: number | null
-  wonFan: number
-  windScore: number
-  rainScore: number
   finalScore: number
+  sessionScore?: number
+  fanSummary?: string | null
 }
-
-interface MatchHistoryItem {
+interface Match {
   gameId: string
   roomId: string
+  code?: string
+  handNumber?: number
+  rules?: { preset: string; fanCap: number }
   endReason: string | null
   winnersCount: number
-  roundNumber: number
   completedAt: string | Date
-  durationMs: number
-  finalScores?: Record<string, number>
-  results: MatchHistoryResult[]
+  results: Result[]
 }
 
-const histories = ref<MatchHistoryItem[]>([])
+const session = useSession()
+const histories = ref<Match[]>([])
 const isLoading = ref(false)
 const errorMessage = ref<string | null>(null)
 const showOnlyMine = ref(false)
-const userIdCookie = useCookie<string | null>('user_id')
+const myUserId = computed(() => session.user.value?.userId ?? null)
 
-const queryUserId = computed(() => {
-  if (!showOnlyMine.value) return undefined
-  return userIdCookie.value || undefined
-})
+useHead({ title: 'Match history · Blood on Mahjong' })
 
 const loadHistory = async () => {
   isLoading.value = true
   errorMessage.value = null
   try {
-    const response = await $fetch<{ success: boolean; data: MatchHistoryItem[] }>('/api/history/list', {
-      query: {
-        limit: 20,
-        ...(queryUserId.value ? { userId: queryUserId.value } : {})
-      },
+    const response = await $fetch<{ success: boolean; data: Match[] }>('/api/history/list', {
+      query: { limit: 30, ...(showOnlyMine.value ? { mine: 1 } : {}) },
       cache: 'no-cache'
     })
-
-    if (response?.success) {
-      histories.value = response.data || []
-    } else {
-      throw new Error('Unable to fetch match history')
-    }
+    histories.value = response.data || []
   } catch (err: any) {
-    errorMessage.value = err?.message || 'Failed to load match history'
+    errorMessage.value = err?.data?.message || err?.message || 'Failed to load match history'
   } finally {
     isLoading.value = false
   }
 }
 
-watch(queryUserId, () => {
+watch(showOnlyMine, loadHistory)
+onMounted(async () => {
+  await session.ensure()
   loadHistory()
 })
 
-onMounted(() => {
-  loadHistory()
-})
-
-const goBack = () => navigateTo('/')
-
-const formatDate = (value: string | Date) => {
-  const date = typeof value === 'string' ? new Date(value) : value
-  return date.toLocaleString()
-}
-
-const formatScore = (value: number) => {
-  const sign = value > 0 ? '+' : ''
-  return `${sign}${value}`
-}
-
-const scoreClass = (value: number) => {
-  if (value > 0) return 'score-positive'
-  if (value < 0) return 'score-negative'
-  return 'score-neutral'
-}
+const formatDate = (value: string | Date) => new Date(value).toLocaleString()
+const fmt = (v: number) => (v > 0 ? `+${v}` : `${v}`)
+const cls = (v: number) => (v > 0 ? 'score-pos' : v < 0 ? 'score-neg' : 'score-zero')
+const reasonLabel = (reason: string | null) =>
+  ({ wall_exhausted: 'draw', last_player: 'blood battle', all_won: 'all won', owner_left: 'host left', empty_room: 'room emptied', cheat: 'test' })[reason ?? ''] ?? (reason || 'finished')
 </script>
 
 <style scoped>
-.history-page {
-  min-height: 100vh;
-  background: radial-gradient(circle at top, #153b2f, #07130e);
-  display: flex;
-  justify-content: center;
-  padding: 24px;
-}
-
-.history-shell {
-  width: min(960px, 100%);
-  background: rgba(7, 19, 14, 0.95);
-  border-radius: 18px;
-  padding: 24px 28px;
-  color: #f5f5f5;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.5);
-}
-
-.history-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-
-.history-header h1 {
-  margin: 0;
-  font-size: 1.4rem;
-}
-
-.subtitle {
-  margin: 0;
-  opacity: 0.75;
-  font-size: 0.9rem;
-}
-
-.ghost-button {
-  background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 999px;
-  padding: 8px 16px;
-  color: inherit;
-  cursor: pointer;
-  font-weight: 600;
-}
-
-.ghost-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.filter-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  margin-bottom: 16px;
-  font-size: 0.9rem;
-}
-
-.toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.filter-hint {
-  opacity: 0.6;
-}
-
-.history-content {
-  min-height: 200px;
-}
-
-.error,
-.loading,
-.empty {
-  text-align: center;
-  opacity: 0.8;
-  margin: 40px 0;
-}
-
-.history-list {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.history-card {
-  background: rgba(255, 255, 255, 0.04);
-  border-radius: 16px;
-  padding: 16px 18px;
-}
-
-.card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.room-label {
-  font-size: 0.8rem;
-  opacity: 0.8;
-  margin: 0;
-}
-
-.card-header h2 {
-  margin: 2px 0 0;
-  font-size: 1.1rem;
-}
-
-.meta {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  align-items: flex-end;
-}
-
-.badge {
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 999px;
-  padding: 4px 12px;
-  font-size: 0.85rem;
-  font-weight: 600;
-}
-
-.badge.subtle {
-  opacity: 0.8;
-}
-
-.player-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.player-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  background: rgba(0, 0, 0, 0.2);
-  border-radius: 12px;
-  padding: 10px 12px;
-}
-
-.player-row.winner {
-  border: 1px solid rgba(255, 226, 122, 0.4);
-}
-
-.player-row.me {
-  box-shadow: 0 0 0 1px rgba(95, 255, 176, 0.35);
-}
-
-.player-name {
-  margin: 0;
-  font-weight: 600;
-}
-
-.player-meta {
-  margin: 2px 0 0;
-  font-size: 0.8rem;
-  opacity: 0.75;
-}
-
-.player-score {
-  font-weight: 600;
-  padding: 4px 12px;
-  border-radius: 999px;
-}
-
-.score-positive {
-  color: #5fffb0;
-  background: rgba(95, 255, 176, 0.1);
-}
-
-.score-negative {
-  color: #ff9d9d;
-  background: rgba(255, 157, 157, 0.1);
-}
-
-.score-neutral {
-  color: #f5f5f5;
-  background: rgba(255, 255, 255, 0.08);
-}
-
-@media (max-width: 640px) {
-  .history-shell {
-    padding: 20px;
-  }
-
-  .card-header {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-
-  .meta {
-    flex-direction: row;
-  }
-}
+.history { align-items: flex-start; }
+.shell { max-width: 900px; }
+.head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.filter { display: flex; align-items: center; gap: 10px; font-size: 0.9rem; color: var(--ink-dim); margin-bottom: 16px; }
+.muted { color: var(--ink-faint); }
+.list { display: flex; flex-direction: column; gap: 12px; }
+.match { border: 1px solid var(--panel-border); border-radius: 14px; padding: 14px; background: rgba(255, 255, 255, 0.03); }
+.match-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.room { margin: 0; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-faint); }
+h2 { margin: 2px 0 0; font-size: 1rem; }
+.meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: flex-start; }
+.players { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.players li { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 10px; background: rgba(255, 255, 255, 0.04); }
+.players li.winner { background: rgba(239, 83, 80, 0.12); }
+.players li.me { outline: 1px solid rgba(233, 196, 106, 0.5); }
+.pname { margin: 0; font-weight: 600; }
+.pmeta { margin: 2px 0 0; font-size: 0.8rem; color: var(--ink-dim); }
+.pscore { display: flex; flex-direction: column; align-items: flex-end; font-variant-numeric: tabular-nums; }
+.pscore b { font-size: 1.1rem; }
+.pscore small { font-size: 0.72rem; }
 </style>

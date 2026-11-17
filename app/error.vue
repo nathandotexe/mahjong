@@ -8,7 +8,7 @@
             {{ is404 ? 'Room / Page Not Found' : 'Something went wrong' }}
           </h1>
           <p class="mahjong-subtitle">
-            血战到底 · Mahjong Online
+            Blood Battle · Mahjong Online
           </p>
         </div>
 

@@ -47,7 +47,7 @@ export default defineEventHandler(async (event) => {
 
     // Check if user exists
     const users = await getCollection<User>('users')
-    let user = await users.findOne({ email: googleUser.email })
+    let user: User | null = await users.findOne({ email: googleUser.email })
 
     if (!user) {
       // Create new user

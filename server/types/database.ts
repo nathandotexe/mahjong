@@ -1,5 +1,5 @@
 import { ObjectId } from 'mongodb';
-import type { PendingAction } from './game';
+import type { PendingAction, RuleConfig, WinRecord, ScoreEvent } from './game';
 
 /**
  * User Collection - Account + Profile + Login Info
@@ -10,7 +10,7 @@ export interface User {
   email: string;
   name: string;
   avatar?: string;
-  oauthProvider: 'google' | 'local'; // OAuth provider
+  oauthProvider: 'google' | 'local' | 'guest'; // OAuth provider
   oauthId?: string; // Google ID
   isAdmin: boolean;
   createdAt: Date;
@@ -88,8 +88,8 @@ export interface GamePlayer {
   isDealer: boolean;
   isTing: boolean;
   missingSuit: 'dots' | 'wan' | 'tiao' | null;
-  windScore: number; // Kong scores (刮风)
-  rainScore: number; // Concealed kong scores (下雨)
+  windScore: number; // Kong scores (wind)
+  rainScore: number; // Concealed kong scores (rain)
   wonFan: number;
   winOrder: number | null;
   winRound: number | null;
@@ -161,18 +161,26 @@ export interface MatchHistory {
   _id?: ObjectId;
   gameId: string;
   roomId: string;
+  code?: string;
+  handNumber?: number;
+  rules?: RuleConfig;
   endReason: string | null;
   winnersCount: number;
   roundNumber: number;
   completedAt: Date;
   durationMs: number;
   finalScores?: Record<string, number>;
+  sessionScores?: Record<string, number>;
+  wins?: WinRecord[];
+  ledger?: ScoreEvent[];
   results: MatchHistoryResult[];
 }
 
 export interface MatchHistoryResult {
   playerId: string;
+  userId?: string;
   name: string;
+  avatar?: string | null;
   position: number;
   status: 'waiting' | 'playing' | 'won' | 'lost';
   winOrder: number | null;
@@ -182,6 +190,8 @@ export interface MatchHistoryResult {
   windScore: number;
   rainScore: number;
   finalScore: number;
+  sessionScore?: number;
+  fanSummary?: string | null;
 }
 
 /**

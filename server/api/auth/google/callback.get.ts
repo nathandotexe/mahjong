@@ -1,7 +1,7 @@
 import { getCollection } from '../../../utils/mongo'
 import type { User } from '../../../types/database'
 import { randomUUID } from 'crypto'
-import { setCookie } from 'h3'
+import { issueSession } from '../../../utils/session'
 
 interface GoogleUserPayload {
   sub: string
@@ -90,20 +90,11 @@ export default defineEventHandler(async (event) => {
       }
     }
 
-    const sessionToken = tokens.access_token ?? `session-${user.userId}`
+    console.log('[GoogleOAuth] Issuing session and redirecting', { userId: user.userId })
+    await issueSession(event, user)
 
-    console.log('[GoogleOAuth] Setting auth cookie and redirecting', { userId: user.userId })
-
-    setCookie(event, 'auth_token', sessionToken, {
-      httpOnly: false,
-      sameSite: 'lax',
-      maxAge: 60 * 60 * 24 * 7,
-      path: '/'
-    })
-    setCookie(event, 'user_name', user.name, { path: '/', maxAge: 60 * 60 * 24 * 7 })
-    setCookie(event, 'is_admin', user.isAdmin ? 'true' : 'false', { path: '/', maxAge: 60 * 60 * 24 * 7 })
-
-    return sendRedirect(event, '/', 302)
+    const next = typeof query.state === 'string' && query.state.startsWith('/') ? query.state : '/'
+    return sendRedirect(event, next, 302)
   } catch (error: any) {
     console.error('Google OAuth Callback Error:', error)
     throw createError({

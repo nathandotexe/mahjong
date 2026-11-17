@@ -1,186 +1,124 @@
 <template>
-  <div
+  <button
+    type="button"
     class="tile"
     :class="[
-      `tile--${tile.suit}`,
+      `tile--${size}`,
       {
+        'tile--back': back,
         'tile--selected': selected,
-        'tile--just-drawn': justDrawn,
-        'tile--claim': claimHighlight,
+        'tile--drawn': drawn,
+        'tile--highlight': highlight,
         'tile--dimmed': dimmed,
-        'tile--small': small
+        'tile--void': voidSuit,
+        'tile--clickable': clickable,
+        'tile--flat': flat
       }
     ]"
-    @click="onClick"
+    :disabled="!clickable"
+    :aria-label="back ? 'hidden tile' : `${tile.value}${suitName}`"
+    @click="clickable && emit('click', tile)"
   >
-    <template v-if="!back">
-      <div class="tile-rank">{{ tile.value }}</div>
-      <div class="tile-suit">
-        <span v-if="tile.suit === 'wan'">萬</span>
-        <span v-else-if="tile.suit === 'dots'">筒</span>
-        <span v-else>條</span>
-      </div>
-    </template>
-    <template v-else>
-      <div class="tile-back-pattern" />
-    </template>
-  </div>
+    <span class="tile-body">
+      <TileFace v-if="!back && tile.value > 0" :suit="tile.suit" :value="tile.value" />
+      <span v-else class="tile-back-pattern" />
+    </span>
+  </button>
 </template>
 
 <script setup lang="ts">
 import type { Tile } from '~/types/game'
 
-const props = defineProps<{
-  tile: Tile
-  selected?: boolean
-  dimmed?: boolean
-  small?: boolean
-  back?: boolean
-  justDrawn?: boolean
-  claimHighlight?: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    tile: Tile
+    size?: 'xs' | 'sm' | 'md' | 'lg'
+    back?: boolean
+    selected?: boolean
+    drawn?: boolean
+    highlight?: boolean
+    dimmed?: boolean
+    voidSuit?: boolean
+    clickable?: boolean
+    flat?: boolean
+  }>(),
+  { size: 'md', back: false, selected: false, drawn: false, highlight: false, dimmed: false, voidSuit: false, clickable: false, flat: false }
+)
 
-const emit = defineEmits<{
-  (e: 'click', tile: Tile): void
-}>()
+const emit = defineEmits<{ (e: 'click', tile: Tile): void }>()
 
-const onClick = () => {
-  emit('click', props.tile)
-}
+const suitName = computed(() => (props.tile.suit === 'wan' ? ' Characters' : props.tile.suit === 'dots' ? ' Dots' : ' Bamboo'))
 </script>
 
 <style scoped>
 .tile {
-  width: 40px;
-  height: 60px;
-  border-radius: 6px;
-  background: #fdfaf3;
-  border: 1px solid #e1d4b8;
-  box-shadow: 0 3px 7px rgba(0, 0, 0, 0.35);
+  --w: var(--tile-w);
+  --h: var(--tile-h);
+  position: relative;
+  width: var(--w);
+  height: var(--h);
+  padding: 0;
+  border: none;
+  background: transparent;
+  border-radius: calc(var(--w) * 0.14);
+  cursor: default;
+  flex: none;
+  transition: transform 0.14s ease, filter 0.14s ease, opacity 0.14s ease;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  touch-action: manipulation;
+}
+.tile--xs { --w: calc(var(--tile-w) * 0.42); --h: calc(var(--tile-h) * 0.42); }
+.tile--sm { --w: calc(var(--tile-w) * 0.6); --h: calc(var(--tile-h) * 0.6); }
+.tile--lg { --w: calc(var(--tile-w) * 1.15); --h: calc(var(--tile-h) * 1.15); }
+
+.tile-body {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(160deg, var(--tile-face) 0%, var(--tile-face-2) 100%);
+  box-shadow:
+    inset 0 -3px 0 rgba(0, 0, 0, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    0 2px 4px rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--tile-edge);
+  overflow: hidden;
+  padding: 6% 8%;
+  box-sizing: border-box;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  margin: 0 1px;
-  cursor: pointer;
-  transition:
-    transform 0.12s ease,
-    box-shadow 0.12s ease,
-    background 0.12s ease,
-    opacity 0.12s ease,
-    border-color 0.12s ease;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  user-select: none;
 }
+.tile--flat .tile-body { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4); }
 
-.tile--small {
-  width: 32px;
-  height: 48px;
-  font-size: 0.8rem;
+.tile--back .tile-body {
+  background: linear-gradient(160deg, var(--tile-back) 0%, var(--tile-back-2) 100%);
+  border-color: #0d3b2f;
+  padding: 14%;
 }
-
-.tile-rank {
-  font-size: 1rem;
-  font-weight: 700;
-}
-
-.tile-suit {
-  font-size: 0.85rem;
-}
-
-.tile--wan .tile-rank,
-.tile--wan .tile-suit {
-  color: #d32f2f;
-}
-
-.tile--dots .tile-rank,
-.tile--dots .tile-suit {
-  color: #1565c0;
-}
-
-
-.tile--tiao .tile-rank,
-.tile--tiao .tile-suit {
-  color: #2e7d32;
-}
-
-/* user-selected tile: raised */
-.tile--selected {
-  transform: translateY(-6px);
-  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.45);
-}
-
-/* newly drawn tile: yellow glow */
-.tile--just-drawn {
-  border-color: #ffc107;
-  box-shadow: 0 0 0 3px rgba(255, 193, 7, 0.7);
-}
-
-/* pung/kong candidate or claimable discard: orange glow */
-.tile--claim {
-  border-color: #ff9800;
-  box-shadow: 0 0 0 3px rgba(255, 152, 0, 0.7);
-}
-
-.tile--dimmed {
-  opacity: 0.4;
-  cursor: default;
-}
-
 .tile-back-pattern {
-  width: 70%;
-  height: 70%;
+  width: 100%;
+  height: 100%;
   border-radius: 4px;
-  background: repeating-linear-gradient(
-    45deg,
-    #00897b,
-    #00897b 4px,
-    #004d40 4px,
-    #004d40 8px
-  );
-  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.2);
+  background:
+    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.12) 0 3px, transparent 3px 7px),
+    radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.16), transparent 60%);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25);
 }
 
-@media (max-width: 1300px) {
-  .tile {
-    width: 25px;
-    height: 30px;
-  }
-
-  .tile--small {
-    width: 25px;
-    height: 30px;
-  }
-
-  .tile-rank {
-    font-size: 0.7rem;
-    line-height: 1
-  }
-
-  .tile-suit {
-    font-size: 0.7rem;
-    line-height: 1
-  }
+.tile--clickable { cursor: pointer; }
+.tile--clickable:hover { transform: translateY(-4px); }
+.tile--selected { transform: translateY(-14px) !important; }
+.tile--selected .tile-body { box-shadow: 0 10px 18px rgba(0, 0, 0, 0.5), 0 0 0 2px var(--gold); }
+.tile--drawn { margin-left: calc(var(--w) * 0.28); }
+.tile--drawn .tile-body { box-shadow: 0 0 0 2px rgba(233, 196, 106, 0.85), 0 2px 4px rgba(0, 0, 0, 0.45); }
+.tile--highlight .tile-body { box-shadow: 0 0 0 2px #ff9800, 0 0 14px rgba(255, 152, 0, 0.7); }
+.tile--dimmed { opacity: 0.38; filter: grayscale(0.4); }
+.tile--void .tile-body::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(135deg, rgba(239, 83, 80, 0.22) 0 4px, transparent 4px 10px);
+  pointer-events: none;
 }
-
-@media (max-width: 900px) {
-  .tile {
-    width: 20px;
-    height: 25px;
-  }
-
-  .tile--small {
-    width: 20px;
-    height: 25px;
-  }
-
-  .tile-rank {
-    font-size: 0.5rem;
-  }
-
-  .tile-suit {
-    font-size: 0.5rem;
-  }
-}
-
 </style>

@@ -1,829 +1,595 @@
-import { 
-  GameState, 
-  GamePhase, 
-  Player, 
-  PlayerStatus, 
-  Tile, 
-  ActionType,
-  GameAction,
-  Meld,
-  MeldType,
-  PendingAction,
-  TileSuit,
-  GameEndReason
-} from '../types/game';
-import { createDeck, shuffleTiles, findTileById, removeTile, sortTiles, tilesEqual, groupTiles, isMissingOneSuit } from './tiles';
-import { canWin, isTing } from './handValidator';
-import { calculateFan, calculateWinningScore, calculateKongScore, calculateGameResult } from './scoring';
-import { randomUUID } from 'crypto';
-import { saveGameState, loadGameState, loadAllGameStates, deleteGameState } from './gamePersistence';
-import { MatchHistoryService } from '../services/matchHistoryService';
-
 /**
- * In-memory game state manager
+ * Game orchestrator: serialises mutations per game, persists with optimistic concurrency,
+ * applies engine deadlines and hands per-player views to whatever transport is in use.
+ *
+ * Two runtime modes (see realtimeMode.ts):
+ *  - socket: one long-running process. Live games are cached in memory, timers fire on their
+ *            own and every change is pushed to Socket.IO rooms.
+ *  - poll:   stateless serverless functions (Vercel). Nothing in memory is trusted: every
+ *            command reloads from the database, conflicting writes are retried, and expired
+ *            timers / presence changes are applied lazily by `refresh()` when a client polls.
  */
+import {
+  ActionType,
+  GameEndReason,
+  GamePhase,
+  type GameEvent,
+  type GameState,
+  type GameView,
+  type RuleConfig
+} from '../../shared/types/game'
+import * as engine from '../engine/engine'
+import { EngineError, createContext, type ActionPayload, type SeatUser } from '../engine/engine'
+import { buildView, maskEvents } from '../engine/view'
+import { normalizeRoomCode } from '../engine/codes'
+import {
+  PersistConflictError,
+  deleteGameState,
+  loadGameByCode,
+  loadGameState,
+  loadGamesForUser,
+  loadWaitingGameStates,
+  saveGameState
+} from './gamePersistence'
+import { MatchHistoryService } from '../services/matchHistoryService'
+import { isStateless } from './realtimeMode'
+
+export type Broadcaster = (state: GameState, events: GameEvent[]) => void | Promise<void>
+
+const DISCONNECT_GRACE_MS = 45_000
+const WAITING_UNSEAT_MS = 90_000
+const EMPTY_ROOM_TTL_MS = 10 * 60_000
+/** Poll mode: how often a polling player's `lastSeenAt` is written back. */
+const PRESENCE_WRITE_MS = 15_000
+const RECENT_EVENTS_KEPT = 60
+const MUTATE_ATTEMPTS = 4
+const CHAT_MIN_GAP_MS = 600
+/** Poll mode: at most this many expired deadlines are applied in one request. */
+const MAX_TICKS_PER_REFRESH = 8
+
+export interface ActorContext {
+  userId: string
+  isAdmin?: boolean
+  /** Admin only: act on behalf of another seat. */
+  asPlayerId?: string
+}
+
+function isNoop(error: unknown): boolean {
+  return error instanceof EngineError && error.code === 'noop'
+}
+
+function deadlineDue(state: GameState, now: number): boolean {
+  if (state.phase === GamePhase.WAITING || state.phase === GamePhase.ENDED) return false
+  const deadline = engine.nextDeadline(state)
+  return deadline !== null && now >= deadline
+}
+
+/** Poll mode: has this seated (non-bot) player stopped polling? */
+function presenceStale(state: GameState, now: number): boolean {
+  return state.players.some(p => {
+    if (p.isBot) return false
+    const away = now - p.lastSeenAt
+    if (state.phase === GamePhase.WAITING) return away > WAITING_UNSEAT_MS || (p.connected && away > DISCONNECT_GRACE_MS)
+    return p.connected && away > DISCONNECT_GRACE_MS
+  })
+}
+
+function idleFor(state: GameState, now: number): number {
+  const humans = state.players.filter(p => !p.isBot)
+  return now - Math.max(state.lastActionTime, ...humans.map(p => p.lastSeenAt))
+}
+
 class GameManager {
-  private games: Map<string, GameState> = new Map();
-  private playerToGame: Map<string, string> = new Map();
-  private wsManager: any = null;
-  private isHydrated = false;
+  private games = new Map<string, GameState>()
+  private queues = new Map<string, Promise<unknown>>()
+  private timers = new Map<string, NodeJS.Timeout>()
+  private graceTimers = new Map<string, NodeJS.Timeout>()
+  private broadcaster: Broadcaster | null = null
+  private sweeper: NodeJS.Timeout | null = null
 
-  setWebSocketManager(manager: any) {
-    this.wsManager = manager;
+  private get stateless() {
+    return isStateless()
   }
 
-  private async hydrateFromDatabase() {
-    if (this.isHydrated) return;
-    const persistedGames = await loadAllGameStates();
-    for (const game of persistedGames) {
-      this.games.set(game.gameId, game);
-      for (const player of game.players) {
-        this.playerToGame.set(player.id, game.gameId);
-      }
+  setBroadcaster(fn: Broadcaster | null) {
+    this.broadcaster = fn
+    if (!this.sweeper && !this.stateless) {
+      this.sweeper = setInterval(() => this.sweepEmptyRooms().catch(() => {}), 60_000)
+      this.sweeper.unref?.()
     }
-    this.isHydrated = true;
   }
 
-  private async ensureGameLoaded(gameId: string): Promise<GameState | undefined> {
-    if (this.games.has(gameId)) {
-      return this.games.get(gameId);
-    }
+  // ---------- loading ----------
 
-    const stored = await loadGameState(gameId);
+  private async load(gameId: string): Promise<GameState | null> {
+    if (this.stateless) return loadGameState(gameId)
+    const cached = this.games.get(gameId)
+    if (cached) return cached
+    const stored = await loadGameState(gameId)
     if (stored) {
-      this.games.set(gameId, stored);
-      for (const player of stored.players) {
-        this.playerToGame.set(player.id, gameId);
+      this.games.set(gameId, stored)
+      this.scheduleTimer(stored)
+    }
+    return stored
+  }
+
+  async getGame(gameId: string): Promise<GameState | null> {
+    return this.load(gameId)
+  }
+
+  async getGameByCode(rawCode: string): Promise<GameState | null> {
+    const code = normalizeRoomCode(rawCode)
+    if (this.stateless) return loadGameByCode(code)
+    for (const game of this.games.values()) {
+      if (game.code === code && game.phase !== GamePhase.ENDED) return game
+    }
+    const stored = await loadGameByCode(code)
+    if (!stored) return null
+    const cached = this.games.get(stored.gameId)
+    if (cached) return cached
+    this.games.set(stored.gameId, stored)
+    this.scheduleTimer(stored)
+    return stored
+  }
+
+  async findLiveGameForUser(userId: string): Promise<GameState | null> {
+    if (this.stateless) {
+      const now = Date.now()
+      for (const game of await loadGamesForUser(userId)) {
+        if (idleFor(game, now) < EMPTY_ROOM_TTL_MS) return game
+        // Abandoned while nobody was polling: close it so it stops showing up.
+        await this.mutate(game.gameId, (state, ctx) => {
+          if (state.phase === GamePhase.ENDED || idleFor(state, ctx.now) < EMPTY_ROOM_TTL_MS) throw new EngineError('noop', 'live')
+          engine.abortHand(state, GameEndReason.EMPTY_ROOM, ctx)
+        }).catch(error => {
+          if (!isNoop(error)) console.error('[sweep] abort failed:', error)
+        })
       }
-      return stored;
+      return null
     }
-
-    return undefined;
+    for (const game of this.games.values()) {
+      if (game.phase !== GamePhase.ENDED && game.players.some(p => p.userId === userId)) return game
+    }
+    const stored = await loadGamesForUser(userId)
+    const live = stored[0]
+    if (!live) return null
+    const cached = this.games.get(live.gameId)
+    if (cached) return cached
+    this.games.set(live.gameId, live)
+    return live
   }
 
-  private async persistGame(game: GameState) {
-    await saveGameState(game);
+  async listWaitingGames() {
+    const stored = await loadWaitingGameStates()
+    const byId = new Map(stored.map(s => [s.gameId, s]))
+    if (!this.stateless) {
+      for (const game of this.games.values()) if (game.phase === GamePhase.WAITING) byId.set(game.gameId, game)
+    }
+    const now = Date.now()
+    return Array.from(byId.values())
+      // Poll mode has no sweeper: hide rooms whose players all stopped polling.
+      .filter(game => !this.stateless || idleFor(game, now) < WAITING_UNSEAT_MS)
+      .sort((a, b) => b.lastActionTime - a.lastActionTime)
+      .map(game => ({
+        gameId: game.gameId,
+        code: game.code,
+        playerCount: game.players.length,
+        players: game.players.map(p => ({ name: p.name, avatar: p.avatar ?? null, isHost: p.isHost })),
+        hostName: game.players.find(p => p.isHost)?.name ?? null,
+        rules: game.rules,
+        createdAt: new Date(game.createdAt).toISOString(),
+        updatedAt: new Date(game.lastActionTime).toISOString()
+      }))
   }
 
-  private broadcastGameState(gameId: string) {
-    if (!this.wsManager) return;
-    const game = this.games.get(gameId);
-    if (!game) return;
-
-    this.wsManager.broadcast(gameId, 'gameStateUpdate', {
-      gameId,
-      phase: game.phase,
-      currentPlayerIndex: game.currentPlayerIndex,
-      discardPile: game.discardPile,
-      wallCount: game.wall.length,
-      winnersCount: game.winnersCount
-    });
-  }
+  // ---------- mutation pipeline ----------
 
   /**
-   * Create a new game
+   * Run `fn` against the latest state with exclusive access (per game, per process), then
+   * persist with a version check, reschedule timers and broadcast. If another process saved
+   * first, the state is reloaded and `fn` runs again. Engine errors propagate unchanged.
    */
-  async createGame(playerName: string): Promise<{ gameId: string; playerId: string }> {
-    await this.hydrateFromDatabase();
-
-    const gameId = randomUUID();
-    const playerId = randomUUID();
-
-    const player: Player = {
-      id: playerId,
-      name: playerName,
-      position: 0,
-      hand: {
-        concealedTiles: [],
-        exposedMelds: [],
-        discardedTiles: []
-      },
-      status: PlayerStatus.WAITING,
-      isDealer: true,
-      isTing: false,
-      missingSuit: null,
-      windScore: 0,
-      rainScore: 0,
-      wonFan: 0,
-      winOrder: null,
-      winRound: null,
-      winTimestamp: null,
-      score: 0
-    };
-
-    const game: GameState = {
-      gameId,
-      phase: GamePhase.WAITING,
-      endReason: null,
-      players: [player],
-      wall: [],
-      currentPlayerIndex: 0,
-      dealerIndex: 0,
-      discardPile: [],
-      actionHistory: [],
-      winnersCount: 0,
-      roundNumber: 1,
-      createdAt: Date.now(),
-      lastActionTime: Date.now(),
-      endedAt: undefined,
-      customScoringMode: null,
-      finalScores: undefined,
-      pendingActions: []
-    };
-
-    this.games.set(gameId, game);
-    this.playerToGame.set(playerId, gameId);
-
-    await this.persistGame(game);
-
-    return { gameId, playerId };
-  }
-
-  /**
-   * Join an existing game
-   */
-  async joinGame(gameId: string, playerName: string): Promise<{ playerId: string; position: number }> {
-    await this.hydrateFromDatabase();
-
-    const game = await this.ensureGameLoaded(gameId);
-    if (!game) {
-      throw new Error('Game not found');
-    }
-
-    if (game.phase !== GamePhase.WAITING) {
-      throw new Error('Game already started');
-    }
-
-    if (game.players.length >= 4) {
-      throw new Error('Game is full');
-    }
-
-    const playerId = randomUUID();
-    const position = game.players.length;
-
-    const player: Player = {
-      id: playerId,
-      name: playerName,
-      position,
-      hand: {
-        concealedTiles: [],
-        exposedMelds: [],
-        discardedTiles: []
-      },
-      status: PlayerStatus.WAITING,
-      isDealer: false,
-      isTing: false,
-      missingSuit: null,
-      windScore: 0,
-      rainScore: 0,
-      wonFan: 0,
-      winOrder: null,
-      winRound: null,
-      winTimestamp: null,
-      score: 0
-    };
-
-    game.players.push(player);
-    this.playerToGame.set(playerId, gameId);
-
-    // Auto-start removed. Use manual start.
-    // if (game.players.length === 4) {
-    //   this.startGame(gameId);
-    // }
-
-    // Broadcast update so lobby sees new player
-    await this.persistGame(game);
-    this.broadcastGameState(gameId);
-
-    return { playerId, position };
-  }
-
-  /**
-   * Start the game
-   */
-  public async startGame(gameId: string): Promise<void> {
-    await this.hydrateFromDatabase();
-
-    const game = await this.ensureGameLoaded(gameId);
-    if (!game) return;
-
-    if (game.players.length < 2) {
-      throw new Error('Need at least 2 players to start');
-    }
-
-    game.phase = GamePhase.STARTING;
-    game.endReason = null;
-    game.endedAt = undefined;
-    game.finalScores = undefined;
-    game.customScoringMode = null;
-
-    // Create and shuffle deck
-    const deck = createDeck();
-    game.wall = shuffleTiles(deck);
-
-    // Deal tiles to players (each gets 13 tiles)
-    for (const player of game.players) {
-      player.hand.concealedTiles = [];
-      for (let i = 0; i < 13; i++) {
-        const tile = game.wall.pop()!;
-        player.hand.concealedTiles.push(tile);
-      }
-      player.hand.concealedTiles = sortTiles(player.hand.concealedTiles);
-      player.status = PlayerStatus.PLAYING;
-      player.score = 0;
-    }
-
-    // Dealer draws first tile
-    const firstTile = game.wall.pop()!;
-    game.players[game.dealerIndex].hand.concealedTiles.push(firstTile);
-    game.players[game.dealerIndex].hand.concealedTiles = sortTiles(game.players[game.dealerIndex].hand.concealedTiles);
-
-    for (const player of game.players) {
-      player.winOrder = null;
-      player.winRound = null;
-      player.winTimestamp = null;
-      player.wonFan = 0;
-      player.score = 0;
-    }
-
-    game.currentPlayerIndex = game.dealerIndex;
-    game.phase = GamePhase.PLAYING;
-    game.lastActionTime = Date.now();
-
-    await this.persistGame(game);
-    this.broadcastGameState(gameId);
-  }
-
-  /**
-   * Get game state
-   */
-  async getGame(gameId: string): Promise<GameState | undefined> {
-    await this.hydrateFromDatabase();
-    const game = await this.ensureGameLoaded(gameId);
-    return game;
-  }
-
-  /**
-   * Get game by player ID
-   */
-  async getGameByPlayer(playerId: string): Promise<GameState | undefined> {
-    await this.hydrateFromDatabase();
-    const gameId = this.playerToGame.get(playerId);
-    if (!gameId) return undefined;
-    return this.ensureGameLoaded(gameId);
-  }
-
-  /**
-   * Get available actions for a player
-   */
-  async getAvailableActions(gameId: string, playerId: string): Promise<ActionType[]> {
-    await this.hydrateFromDatabase();
-    const game = await this.ensureGameLoaded(gameId);
-    if (!game || game.phase !== GamePhase.PLAYING) return [];
-
-    const player = game.players.find(p => p.id === playerId);
-    if (!player || player.status !== PlayerStatus.PLAYING) return [];
-
-    const actions: ActionType[] = [];
-    const currentPlayer = game.players[game.currentPlayerIndex];
-
-    if (!currentPlayer) {
-      // Game might still be in setup; no actions available yet
-      return actions;
-    }
-
-    // Check pending actions (peng, kong, hu from another player's discard)
-    const pendingAction = game.pendingActions.find(pa => pa.playerId === playerId);
-    if (pendingAction) {
-      return pendingAction.availableActions;
-    }
-
-    // If it's the player's turn and no one else has pending reactions, allow turn actions
-    if (currentPlayer.id === playerId && game.pendingActions.length === 0) {
-      if (player.hand.concealedTiles.length > 0) {
-        actions.push(ActionType.DISCARD);
-      }
-
-      const exposedTileCount = player.hand.exposedMelds.reduce((sum, meld) => sum + meld.tiles.length, 0);
-      const totalTileCount = player.hand.concealedTiles.length + exposedTileCount;
-
-      if (totalTileCount >= 14) {
-        // Check for concealed kong
-        const groups = groupTiles(player.hand.concealedTiles);
-        for (const group of groups.values()) {
-          if (group.length === 4) {
-            actions.push(ActionType.CONCEALED_KONG);
+  private async mutate<T>(gameId: string, fn: (state: GameState, ctx: engine.EngineContext) => T): Promise<T> {
+    const previous = this.queues.get(gameId) ?? Promise.resolve()
+    const run = previous.catch(() => {}).then(async () => {
+      for (let attempt = 1; ; attempt++) {
+        const state = await this.load(gameId)
+        if (!state) throw new EngineError('game_not_found', 'Game not found')
+        const ctx = createContext()
+        const expectedVersion = state.version
+        const snapshot = JSON.stringify(state)
+        let result: T
+        try {
+          result = fn(state, ctx)
+        } catch (error) {
+          // Roll back any partial mutation so the cached state stays consistent.
+          Object.assign(state, JSON.parse(snapshot))
+          throw error
+        }
+        state.version = expectedVersion + 1
+        if (ctx.events.length) state.recentEvents = [...(state.recentEvents ?? []), ...ctx.events].slice(-RECENT_EVENTS_KEPT)
+        try {
+          await saveGameState(state, expectedVersion)
+        } catch (error) {
+          if (!(error instanceof PersistConflictError)) throw error
+          if (!this.stateless) this.games.delete(gameId)
+          if (attempt >= MUTATE_ATTEMPTS) {
+            throw new EngineError('conflict', 'The table changed while you were acting; please retry')
           }
+          continue
         }
+        await this.afterMutation(state, ctx.events)
+        return result
+      }
+    })
+    this.queues.set(gameId, run)
+    run.finally(() => {
+      if (this.queues.get(gameId) === run) this.queues.delete(gameId)
+    }).catch(() => {})
+    return run
+  }
 
-        // Check for extended kong (if player has exposed triplet and draws the 4th)
-        for (const meld of player.hand.exposedMelds) {
-          if (meld.type === MeldType.TRIPLET) {
-            const hasFourth = player.hand.concealedTiles.some(t => tilesEqual(t, meld.tiles[0]));
-            if (hasFourth) {
-              actions.push(ActionType.EXTENDED_KONG);
-            }
-          }
-        }
-
-        // Check if can win
-        const winCheck = canWin(player.hand.concealedTiles, player.hand.exposedMelds.length);
-        if (winCheck.canWin) {
-          actions.push(ActionType.HU);
-        }
+  private async afterMutation(state: GameState, events: GameEvent[]) {
+    if (!this.stateless) this.scheduleTimer(state)
+    if (events.some(e => e.type === 'hand_ended') && state.phase === GamePhase.ENDED) {
+      const summary = state.handHistory[state.handHistory.length - 1]
+      if (summary && summary.handNumber === state.handNumber && Object.keys(summary.scores).length > 0) {
+        // Awaited: a serverless function may be frozen as soon as the response is sent.
+        await MatchHistoryService.recordHand(state, summary).catch(error => console.error('[history] record failed:', error))
       }
     }
-
-    return actions;
+    if (this.broadcaster) {
+      Promise.resolve(this.broadcaster(state, events)).catch(error => console.error('[broadcast] failed:', error))
+    }
   }
+
+  // ---------- timers (socket mode) ----------
+
+  private scheduleTimer(state: GameState) {
+    const existing = this.timers.get(state.gameId)
+    if (existing) clearTimeout(existing)
+    this.timers.delete(state.gameId)
+    if (state.phase === GamePhase.ENDED || state.phase === GamePhase.WAITING) return
+    const deadline = engine.nextDeadline(state)
+    if (deadline === null) return
+    const delay = Math.max(0, deadline - Date.now()) + 40
+    const timer = setTimeout(() => {
+      this.timers.delete(state.gameId)
+      this.mutate(state.gameId, (s, ctx) => {
+        if (!engine.tick(s, ctx)) throw new EngineError('noop', 'nothing to do')
+      }).catch(error => {
+        if (isNoop(error)) {
+          const current = this.games.get(state.gameId)
+          if (current) this.scheduleTimer(current)
+          return
+        }
+        console.error('[timer] tick failed:', error)
+      })
+    }, delay)
+    timer.unref?.()
+    this.timers.set(state.gameId, timer)
+  }
+
+  // ---------- polling (poll mode) ----------
 
   /**
-   * Execute a game action
+   * Poll mode: bring a game up to date before showing it. Marks the polling user present,
+   * marks players who stopped polling as away (auto-play) or unseats them in the lobby, and
+   * applies every deadline that has expired. Writes only when something actually changed.
    */
-  async executeAction(gameId: string, playerId: string, action: ActionType, tileId?: string, tileIds?: string[]): Promise<void> {
-    await this.hydrateFromDatabase();
-    const game = await this.ensureGameLoaded(gameId);
-    if (!game) throw new Error('Game not found');
-    if (game.phase !== GamePhase.PLAYING) {
-      throw new Error('Game is not active');
-    }
+  async refresh(gameId: string, userId: string | null): Promise<GameState | null> {
+    if (!this.stateless) return this.load(gameId)
+    const loaded = await loadGameState(gameId)
+    if (!loaded) return null
 
-    const player = game.players.find(p => p.id === playerId);
-    if (!player) throw new Error('Player not found');
+    const now = Date.now()
+    const viewer = userId ? loaded.players.find(p => p.userId === userId) : undefined
+    const viewerNeedsWrite = !!viewer && (!viewer.connected || now - viewer.lastSeenAt > PRESENCE_WRITE_MS)
+    if (!viewerNeedsWrite && !deadlineDue(loaded, now) && !presenceStale(loaded, now)) return loaded
 
-    const gameAction: GameAction = {
-      playerId,
-      type: action,
-      timestamp: Date.now()
-    };
+    let latest: GameState = loaded
+    await this.mutate(gameId, (state, ctx) => {
+      latest = state
+      let changed = false
 
-    switch (action) {
-      case ActionType.DISCARD:
-        this.handleDiscard(game, player, tileId!);
-        gameAction.tile = findTileById(player.hand.concealedTiles, tileId!);
-        break;
+      const me = userId ? engine.playerByUser(state, userId) : undefined
+      if (me && !me.connected) {
+        changed = this.markConnected(state, me, ctx) || changed
+      } else if (me && ctx.now - me.lastSeenAt > PRESENCE_WRITE_MS) {
+        me.lastSeenAt = ctx.now
+        changed = true
+      }
 
-      case ActionType.DRAW:
-        this.handleDraw(game, player);
-        break;
+      for (const player of [...state.players]) {
+        if (player.isBot || player.userId === userId) continue
+        const away = ctx.now - player.lastSeenAt
+        if (state.phase === GamePhase.WAITING && away > WAITING_UNSEAT_MS) {
+          engine.unseatPlayer(state, player.id, ctx)
+          changed = true
+        } else if (player.connected && away > DISCONNECT_GRACE_MS) {
+          this.markAway(state, player, ctx)
+          changed = true
+        }
+      }
+      if (state.phase === GamePhase.WAITING && state.players.length === 0) {
+        engine.abortHand(state, GameEndReason.EMPTY_ROOM, ctx)
+        changed = true
+      }
 
-      case ActionType.PENG:
-        this.handlePeng(game, player);
-        break;
+      for (let i = 0; i < MAX_TICKS_PER_REFRESH && deadlineDue(state, ctx.now); i++) {
+        if (!engine.tick(state, ctx)) break
+        changed = true
+      }
 
-      case ActionType.KONG:
-        this.handleKong(game, player, tileId!);
-        break;
-
-      case ActionType.CONCEALED_KONG:
-        this.handleConcealedKong(game, player, tileIds!);
-        break;
-
-      case ActionType.EXTENDED_KONG:
-        this.handleExtendedKong(game, player, tileId!);
-        break;
-
-      case ActionType.HU:
-        this.handleHu(game, player);
-        break;
-
-      case ActionType.CHEAT_HU:
-        this.handleCheatHu(game, player);
-        break;
-
-      case ActionType.PASS:
-        this.handlePass(game, player);
-        break;
-    }
-
-    game.actionHistory.push(gameAction);
-    game.lastActionTime = Date.now();
-
-    // Broadcast game state update
-    await this.persistGame(game);
-    this.broadcastGameState(gameId);
+      if (!changed) throw new EngineError('noop', 'up to date')
+    }).catch(error => {
+      if (!isNoop(error)) throw error
+    })
+    return latest
   }
 
-  private handleDiscard(game: GameState, player: Player, tileId: string): void {
-    const tile = findTileById(player.hand.concealedTiles, tileId);
-    if (!tile) throw new Error('Tile not found');
+  /** Events after `since` (by id) that this viewer may see. */
+  eventsSince(state: GameState, since: number | null, viewerUserId: string | null, isAdmin: boolean): GameEvent[] {
+    if (since === null) return []
+    const events = (state.recentEvents ?? []).filter(e => e.id > since)
+    const viewerPlayerId = viewerUserId ? engine.playerByUser(state, viewerUserId)?.id ?? null : null
+    return maskEvents(events, viewerPlayerId, isAdmin)
+  }
 
-    // Remove from hand
-    player.hand.concealedTiles = removeTile(player.hand.concealedTiles, tileId);
-    player.hand.discardedTiles.push(tile);
-    game.discardPile.push(tile);
+  // ---------- presence helpers ----------
 
-    this.updateRoundNumber(game);
-
-    // Check if player is missing one suit after discard
-    const missing = isMissingOneSuit(player.hand.concealedTiles);
-    if (missing.missing) {
-      player.missingSuit = missing.missingSuit;
+  private markConnected(state: GameState, player: GameState['players'][number], ctx: engine.EngineContext): boolean {
+    if (player.connected && !player.autoPlay) return false
+    player.connected = true
+    player.lastSeenAt = ctx.now
+    player.autoPlay = false
+    if (state.phase === GamePhase.PLAYING && state.players[state.currentPlayerIndex]?.id === player.id && !state.claimWindow) {
+      state.turnDeadline = state.rules.turnSeconds > 0 ? ctx.now + state.rules.turnSeconds * 1000 : null
     }
+    ctx.events.push({ id: ++state.eventSeq, at: ctx.now, type: 'player_connected', playerId: player.id, label: player.name })
+    return true
+  }
 
-    // Check for ting status
-    player.isTing = isTing(player.hand.concealedTiles, player.hand.exposedMelds.length);
-
-    // Check if other players can peng, kong, or hu
-    this.checkPendingActions(game, tile);
-
-    // If no pending actions, move to next player
-    if (game.pendingActions.length === 0) {
-      this.moveToNextPlayer(game);
+  /** Someone has been gone past the grace period: let auto-play take their seat. */
+  private markAway(state: GameState, player: GameState['players'][number], ctx: engine.EngineContext) {
+    player.connected = false
+    ctx.events.push({ id: ++state.eventSeq, at: ctx.now, type: 'player_disconnected', playerId: player.id, label: player.name })
+    if (state.phase !== GamePhase.PLAYING && state.phase !== GamePhase.EXCHANGING && state.phase !== GamePhase.CHOOSING_SUIT) return
+    player.autoPlay = true
+    if (state.players[state.currentPlayerIndex]?.id === player.id && !state.claimWindow) {
+      state.turnDeadline = ctx.now + 1200
+    }
+    // Setup phases keep their shared 30 s timer; it auto-picks for whoever has not chosen.
+    if (state.claimWindow) {
+      const claim = state.claimWindow.claims.find(c => c.playerId === player.id && c.response === null)
+      if (claim) state.claimWindow.deadline = Math.min(state.claimWindow.deadline ?? Infinity, ctx.now + 1200)
     }
   }
 
-  private handleDraw(game: GameState, player: Player): void {
-    if (game.wall.length === 0) {
-      this.endRound(game, GameEndReason.WALL_EXHAUSTED);
-      return;
+  // ---------- public commands ----------
+
+  async createGame(host: SeatUser, rules?: Partial<RuleConfig>): Promise<GameState> {
+    const ctx = createContext()
+    let state = engine.createGame(host, rules, ctx)
+    // Make sure the short code is unique among live rooms.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const clash = await loadGameByCode(state.code)
+      if (!clash || clash.phase === GamePhase.ENDED) break
+      state = engine.createGame(host, rules, ctx)
     }
-
-    const tile = game.wall.pop()!;
-    player.hand.concealedTiles.push(tile);
-    player.hand.concealedTiles = sortTiles(player.hand.concealedTiles);
+    state.version = 1
+    state.recentEvents = ctx.events.slice(-RECENT_EVENTS_KEPT)
+    if (!this.stateless) this.games.set(state.gameId, state)
+    await saveGameState(state, 0)
+    await this.afterMutation(state, ctx.events)
+    return state
   }
 
-  private handlePeng(game: GameState, player: Player): void {
-    const lastDiscard = game.discardPile[game.discardPile.length - 1];
-    if (!lastDiscard) return;
-
-    // Find matching tiles in hand
-    const matchingTiles = player.hand.concealedTiles.filter(t => tilesEqual(t, lastDiscard));
-    if (matchingTiles.length < 2) return;
-
-    // Remove tiles from hand
-    player.hand.concealedTiles = removeTile(player.hand.concealedTiles, matchingTiles[0].id);
-    player.hand.concealedTiles = removeTile(player.hand.concealedTiles, matchingTiles[1].id);
-
-    // Create exposed meld
-    const meld: Meld = {
-      type: MeldType.TRIPLET,
-      tiles: [lastDiscard, matchingTiles[0], matchingTiles[1]],
-      isConcealed: false
-    };
-    player.hand.exposedMelds.push(meld);
-
-    // Remove from discard pile
-    game.discardPile.pop();
-
-    // Clear pending actions
-    game.pendingActions = [];
-
-    // Player must discard
-    game.currentPlayerIndex = game.players.findIndex(p => p.id === player.id);
+  async joinByCode(rawCode: string, user: SeatUser): Promise<GameState> {
+    const game = await this.getGameByCode(rawCode)
+    if (!game) throw new EngineError('game_not_found', 'No room with that code')
+    return this.join(game.gameId, user)
   }
 
-  private handleKong(game: GameState, player: Player, tileId: string): void {
-    const lastDiscard = game.discardPile[game.discardPile.length - 1];
-    if (!lastDiscard) return;
-
-    // Find matching tiles in hand
-    const matchingTiles = player.hand.concealedTiles.filter(t => tilesEqual(t, lastDiscard));
-    if (matchingTiles.length < 3) return;
-
-    // Remove tiles from hand
-    for (let i = 0; i < 3; i++) {
-      player.hand.concealedTiles = removeTile(player.hand.concealedTiles, matchingTiles[i].id);
-    }
-
-    // Create exposed kong
-    const meld: Meld = {
-      type: MeldType.KONG,
-      tiles: [lastDiscard, ...matchingTiles.slice(0, 3)],
-      isConcealed: false
-    };
-    player.hand.exposedMelds.push(meld);
-
-    // Remove from discard pile
-    game.discardPile.pop();
-
-    // Award direct kong score (点杠) - discarder pays 2
-    const discarderIndex = (game.currentPlayerIndex - 1 + game.players.length) % game.players.length;
-    player.windScore += 2;
-
-    // Clear pending actions
-    game.pendingActions = [];
-
-    // Draw supplement tile
-    this.handleDraw(game, player);
-
-    // Player must discard
-    game.currentPlayerIndex = game.players.findIndex(p => p.id === player.id);
+  async join(gameId: string, user: SeatUser): Promise<GameState> {
+    let latest: GameState | null = null
+    await this.mutate(gameId, (state, ctx) => {
+      latest = state
+      engine.seatPlayer(state, user, ctx)
+    })
+    return latest!
   }
 
-  private handleConcealedKong(game: GameState, player: Player, tileIds: string[]): void {
-    if (tileIds.length !== 4) return;
-
-    const tiles = tileIds.map(id => findTileById(player.hand.concealedTiles, id)).filter(t => t) as Tile[];
-    if (tiles.length !== 4) return;
-
-    // Remove from hand
-    for (const tile of tiles) {
-      player.hand.concealedTiles = removeTile(player.hand.concealedTiles, tile.id);
-    }
-
-    // Create concealed kong (still exposed in Sichuan rules)
-    const meld: Meld = {
-      type: MeldType.CONCEALED_KONG,
-      tiles,
-      isConcealed: false
-    };
-    player.hand.exposedMelds.push(meld);
-
-    // Award concealed kong score - each non-winner pays 2
-    const nonWinners = game.players.filter(p => p.status === PlayerStatus.PLAYING && p.id !== player.id);
-    player.rainScore += nonWinners.length * 2;
-
-    // Draw supplement tile
-    this.handleDraw(game, player);
-  }
-
-  private handleExtendedKong(game: GameState, player: Player, tileId: string): void {
-    const tile = findTileById(player.hand.concealedTiles, tileId);
-    if (!tile) return;
-
-    // Find matching exposed triplet
-    const tripletIndex = player.hand.exposedMelds.findIndex(
-      m => m.type === MeldType.TRIPLET && tilesEqual(m.tiles[0], tile)
-    );
-    if (tripletIndex === -1) return;
-
-    // Remove tile from hand
-    player.hand.concealedTiles = removeTile(player.hand.concealedTiles, tileId);
-
-    // Convert triplet to kong
-    player.hand.exposedMelds[tripletIndex].type = MeldType.KONG;
-    player.hand.exposedMelds[tripletIndex].tiles.push(tile);
-
-    // Award extended kong score - each non-winner pays 1
-    const nonWinners = game.players.filter(p => p.status === PlayerStatus.PLAYING && p.id !== player.id);
-    player.windScore += nonWinners.length * 1;
-
-    // Draw supplement tile
-    this.handleDraw(game, player);
-  }
-
-  private handleHu(game: GameState, player: Player): void {
-    const pendingAction = game.pendingActions.find(pa => pa.playerId === player.id);
-    const winningTile = pendingAction?.tile;
-
-    if (winningTile) {
-      player.hand.concealedTiles.push(winningTile);
-      player.hand.concealedTiles = sortTiles(player.hand.concealedTiles);
-
-      const lastDiscard = game.discardPile[game.discardPile.length - 1];
-      if (lastDiscard && lastDiscard.id === winningTile.id) {
-        game.discardPile.pop();
+  async leave(gameId: string, userId: string): Promise<void> {
+    await this.mutate(gameId, (state, ctx) => {
+      const player = engine.playerByUser(state, userId)
+      if (!player) return
+      if (state.phase === GamePhase.WAITING || state.phase === GamePhase.ENDED) {
+        engine.unseatPlayer(state, player.id, ctx)
+        if (state.players.length === 0) {
+          engine.abortHand(state, GameEndReason.EMPTY_ROOM, ctx)
+        }
       } else {
-        const discardIndex = game.discardPile.findIndex(t => t.id === winningTile.id);
-        if (discardIndex !== -1) {
-          game.discardPile.splice(discardIndex, 1);
+        // Mid-hand: the seat stays and is auto-played until they return.
+        player.connected = false
+        player.autoPlay = true
+        player.lastSeenAt = ctx.now
+        if (state.players[state.currentPlayerIndex]?.id === player.id && !state.claimWindow) {
+          state.turnDeadline = ctx.now + 1200
         }
       }
-    }
-
-    // Hu resolves all pending reactions to the discard
-    game.pendingActions = [];
-
-    player.status = PlayerStatus.WON;
-    player.winOrder = game.winnersCount + 1;
-    player.winRound = game.roundNumber;
-    player.winTimestamp = Date.now();
-    game.winnersCount++;
-
-    const existingMelds = player.hand.exposedMelds.length;
-    const winCheck = canWin(player.hand.concealedTiles, existingMelds);
-    if (!winCheck.canWin) {
-      throw new Error('Invalid Hu declaration');
-    }
-
-    const isSelfDrawn = !pendingAction;
-    const isKongFlower = false; // TODO: track if won after kong draw
-    
-    const fan = calculateFan(
-      player.hand.concealedTiles,
-      player.hand.exposedMelds,
-      winCheck.winType!,
-      isSelfDrawn,
-      isKongFlower,
-      false,
-      false,
-      false,
-      false
-    );
-
-    player.wonFan = fan.totalFan;
-
-    const remainingActive = game.players.filter(p => p.status === PlayerStatus.PLAYING).length;
-    if (remainingActive <= 1) {
-      this.endRound(game, GameEndReason.LAST_PLAYER);
-      return;
-    }
-
-    // Continue playing
-    this.moveToNextPlayer(game);
+    })
   }
 
-  private handleCheatHu(game: GameState, player: Player): void {
-    const currentPlayer = game.players[game.currentPlayerIndex];
-    if (!currentPlayer || currentPlayer.id !== player.id) {
-      throw new Error('Cheat Hu is only available on your turn');
-    }
-
-    if (player.status !== PlayerStatus.PLAYING) {
-      return; // ignore if already resolved
-    }
-
-    game.pendingActions = [];
-
-    player.status = PlayerStatus.WON;
-    player.winOrder = game.winnersCount + 1;
-    player.winRound = game.roundNumber;
-    player.winTimestamp = Date.now();
-    player.wonFan = 1; // Testing shortcut awards 1 fan (score +1)
-    game.winnersCount++;
-    game.customScoringMode = 'cheat';
-
-    this.endRound(game, GameEndReason.LAST_PLAYER);
+  async addBot(gameId: string, actor: ActorContext): Promise<void> {
+    await this.mutate(gameId, (state, ctx) => {
+      this.requireHost(state, actor)
+      engine.seatBot(state, ctx)
+    })
   }
 
-  private handlePass(game: GameState, player: Player): void {
-    // Remove player's pending action
-    game.pendingActions = game.pendingActions.filter(pa => pa.playerId !== player.id);
-
-    // If no more pending actions, move to next player
-    if (game.pendingActions.length === 0) {
-      this.moveToNextPlayer(game);
-    }
+  async kick(gameId: string, actor: ActorContext, targetPlayerId: string): Promise<void> {
+    await this.mutate(gameId, (state, ctx) => {
+      this.requireHost(state, actor)
+      engine.unseatPlayer(state, targetPlayerId, ctx)
+    })
   }
 
-  private checkPendingActions(game: GameState, discardedTile: Tile): void {
-    game.pendingActions = [];
+  async updateRules(gameId: string, actor: ActorContext, patch: Partial<RuleConfig>): Promise<void> {
+    await this.mutate(gameId, (state, ctx) => {
+      this.requireHost(state, actor)
+      engine.updateRules(state, patch, ctx)
+    })
+  }
 
-    for (const player of game.players) {
-      if (player.status !== PlayerStatus.PLAYING) continue;
-      if (player.id === game.players[game.currentPlayerIndex].id) continue;
+  async startHand(gameId: string, actor: ActorContext): Promise<void> {
+    await this.mutate(gameId, (state, ctx) => {
+      this.requireHost(state, actor)
+      engine.startHand(state, ctx)
+    })
+  }
 
-      const actions: ActionType[] = [];
-
-      // Check for peng
-      const matchingTiles = player.hand.concealedTiles.filter(t => tilesEqual(t, discardedTile));
-      if (matchingTiles.length >= 2) {
-        actions.push(ActionType.PENG);
+  async act(gameId: string, actor: ActorContext, action: ActionType, payload: ActionPayload = {}): Promise<void> {
+    await this.mutate(gameId, (state, ctx) => {
+      let playerId: string
+      if (actor.asPlayerId && actor.isAdmin) {
+        playerId = actor.asPlayerId
+      } else {
+        const player = engine.playerByUser(state, actor.userId)
+        if (!player) throw new EngineError('not_seated', 'You are not seated at this table')
+        playerId = player.id
       }
-
-      // Check for kong
-      if (matchingTiles.length >= 3) {
-        actions.push(ActionType.KONG);
+      if (action === ActionType.CHEAT_HU && !actor.isAdmin) {
+        throw new EngineError('forbidden', 'Admin privileges required')
       }
+      engine.act(state, playerId, action, payload, ctx)
+    })
+  }
 
-      // Check for hu
-      const testHand = [...player.hand.concealedTiles, discardedTile];
-      if (canWin(testHand, player.hand.exposedMelds.length).canWin) {
-        actions.push(ActionType.HU);
-      }
+  /** Table chat and emotes travel as `chat` events, so every transport delivers them the same way. */
+  async chat(gameId: string, user: { userId: string; name: string }, kind: 'message' | 'emote', rawText: string): Promise<void> {
+    const text = String(rawText ?? '').trim().slice(0, kind === 'emote' ? 8 : 200)
+    if (!text) return
+    await this.mutate(gameId, (state, ctx) => {
+      const last = [...(state.recentEvents ?? [])].reverse().find(e => e.type === 'chat' && e.payload?.userId === user.userId)
+      if (last && ctx.now - last.at < CHAT_MIN_GAP_MS) throw new EngineError('noop', 'too fast')
+      const player = engine.playerByUser(state, user.userId)
+      ctx.events.push({
+        id: ++state.eventSeq,
+        at: ctx.now,
+        type: 'chat',
+        playerId: player?.id,
+        label: user.name,
+        payload: { kind, text, userId: user.userId }
+      })
+    }).catch(error => {
+      if (!isNoop(error)) throw error
+    })
+  }
 
-      if (actions.length > 0) {
-        actions.push(ActionType.PASS);
-        game.pendingActions.push({
-          playerId: player.id,
-          availableActions: actions,
-          tile: discardedTile,
-          expiresAt: Date.now() + 30000 // 30 seconds to respond
-        });
+  async setConnected(gameId: string, userId: string, connected: boolean): Promise<void> {
+    const key = `${gameId}:${userId}`
+    const grace = this.graceTimers.get(key)
+    if (grace) {
+      clearTimeout(grace)
+      this.graceTimers.delete(key)
+    }
+    await this.mutate(gameId, (state, ctx) => {
+      const player = engine.playerByUser(state, userId)
+      if (!player) throw new EngineError('noop', 'not seated')
+      if (connected) {
+        if (!this.markConnected(state, player, ctx)) throw new EngineError('noop', 'unchanged')
+        return
       }
+      if (!player.connected) throw new EngineError('noop', 'unchanged')
+      player.connected = false
+      player.lastSeenAt = ctx.now
+      ctx.events.push({ id: ++state.eventSeq, at: ctx.now, type: 'player_disconnected', playerId: player.id, label: player.name })
+    }).catch(error => {
+      if (!isNoop(error)) throw error
+    })
+
+    if (!connected) {
+      const timer = setTimeout(() => {
+        this.graceTimers.delete(key)
+        this.afterGrace(gameId, userId).catch(error => console.error('[grace] failed:', error))
+      }, DISCONNECT_GRACE_MS)
+      timer.unref?.()
+      this.graceTimers.set(key, timer)
     }
   }
 
-  private moveToNextPlayer(game: GameState): void {
-    if (game.phase !== GamePhase.PLAYING) {
-      return;
-    }
-
-    if (game.players.length === 0) {
-      throw new Error('No players available to take a turn');
-    }
-
-    let rotations = 0;
-    do {
-      game.currentPlayerIndex = (game.currentPlayerIndex + 1) % game.players.length;
-      rotations++;
-      if (rotations > game.players.length) {
-        throw new Error('No active players remaining in the round');
+  private async afterGrace(gameId: string, userId: string) {
+    await this.mutate(gameId, (state, ctx) => {
+      const player = engine.playerByUser(state, userId)
+      if (!player || player.connected) throw new EngineError('noop', 'reconnected')
+      if (state.phase === GamePhase.WAITING) {
+        if (ctx.now - player.lastSeenAt < WAITING_UNSEAT_MS - DISCONNECT_GRACE_MS) throw new EngineError('noop', 'still within grace')
+        engine.unseatPlayer(state, player.id, ctx)
+        if (state.players.length === 0) engine.abortHand(state, GameEndReason.EMPTY_ROOM, ctx)
+        return
       }
-    } while (game.players[game.currentPlayerIndex].status !== PlayerStatus.PLAYING);
-
-    // Draw tile for next player once we have a valid target
-    const nextPlayer = game.players[game.currentPlayerIndex];
-    this.handleDraw(game, nextPlayer);
+      if (state.phase === GamePhase.ENDED) throw new EngineError('noop', 'ended')
+      player.autoPlay = true
+      if (state.players[state.currentPlayerIndex]?.id === player.id && !state.claimWindow) {
+        state.turnDeadline = ctx.now + 1200
+      }
+      if (state.claimWindow) {
+        const claim = state.claimWindow.claims.find(c => c.playerId === player.id && c.response === null)
+        if (claim) state.claimWindow.deadline = Math.min(state.claimWindow.deadline ?? Infinity, ctx.now + 1200)
+      }
+    }).catch(error => {
+      if (!isNoop(error)) throw error
+    })
   }
 
-  private updateRoundNumber(game: GameState): void {
-    const playerCount = game.players.length || 1;
-    const discardCount = game.discardPile.length;
-    const calculatedRound = Math.max(1, Math.ceil(discardCount / playerCount));
-    game.roundNumber = calculatedRound;
-  }
-
-  private endRound(game: GameState, reason: GameEndReason): void {
-    game.phase = GamePhase.CHA_JIAO;
-
-    // Calculate final scores
-    const winners = game.players.filter(p => p.status === PlayerStatus.WON);
-      const winnerIds = new Set(winners.map(w => w.id));
-      for (const player of game.players) {
-        if (!winnerIds.has(player.id)) {
-          player.status = PlayerStatus.LOST;
+  private async sweepEmptyRooms() {
+    const now = Date.now()
+    for (const game of Array.from(this.games.values())) {
+      const anyoneHere = game.players.some(p => p.connected && !p.isBot)
+      if (anyoneHere) continue
+      if (now - Math.max(game.lastActionTime, ...game.players.map(p => p.lastSeenAt)) < EMPTY_ROOM_TTL_MS) continue
+      try {
+        if (game.phase !== GamePhase.ENDED) {
+          await this.mutate(game.gameId, (state, ctx) => engine.abortHand(state, GameEndReason.EMPTY_ROOM, ctx))
         }
+      } catch (error) {
+        console.error('[sweep] abort failed:', error)
       }
-    let finalScores: Record<string, number>;
-
-    if (game.customScoringMode === 'cheat') {
-      finalScores = {};
-      for (const player of game.players) {
-        const isWinner = winners.some(w => w.id === player.id);
-        finalScores[player.id] = isWinner ? 1 : -1;
-      }
-    } else {
-      finalScores = calculateGameResult(game.players, winners);
+      const timer = this.timers.get(game.gameId)
+      if (timer) clearTimeout(timer)
+      this.timers.delete(game.gameId)
+      this.games.delete(game.gameId)
+      this.queues.delete(game.gameId)
     }
-
-    game.finalScores = finalScores;
-    for (const player of game.players) {
-      player.score = finalScores[player.id] ?? 0;
-    }
-
-    // TODO: Store results and prepare for next round
-
-    const endedAt = Date.now();
-    game.phase = GamePhase.ENDED;
-    game.endReason = reason;
-    game.pendingActions = [];
-    game.endedAt = endedAt;
-    game.lastActionTime = endedAt;
-    game.customScoringMode = null;
-
-    MatchHistoryService.recordMatch(game, finalScores, reason).catch((error) => {
-      console.error('Failed to persist match history:', error);
-    });
   }
 
-  async endGameForEmptyRoom(gameId: string, reason: GameEndReason = GameEndReason.EMPTY_ROOM): Promise<void> {
-    await this.hydrateFromDatabase();
-    const game = await this.ensureGameLoaded(gameId);
-    if (!game) return;
-
-    if (game.phase === GamePhase.ENDED) {
-      game.endReason = reason;
-      await this.persistGame(game);
-      return;
-    }
-
-    for (const player of game.players) {
-      if (player.status !== PlayerStatus.WON) {
-        player.status = PlayerStatus.LOST;
-      }
-      player.isTing = false;
-    }
-
-    game.pendingActions = [];
-    this.endRound(game, reason);
-
-    await this.persistGame(game);
-    this.broadcastGameState(gameId);
-  }
-
-  /**
-   * List all active games
-   */
-  async listGames(): Promise<GameState[]> {
-    await this.hydrateFromDatabase();
-    return Array.from(this.games.values());
-  }
-
-  /**
-   * Delete a game
-   */
   async deleteGame(gameId: string): Promise<void> {
-    await this.hydrateFromDatabase();
-    const game = await this.ensureGameLoaded(gameId);
-    if (game) {
-      for (const player of game.players) {
-        this.playerToGame.delete(player.id);
-      }
-      this.games.delete(gameId);
-    }
-    await deleteGameState(gameId);
+    const timer = this.timers.get(gameId)
+    if (timer) clearTimeout(timer)
+    this.timers.delete(gameId)
+    this.games.delete(gameId)
+    this.queues.delete(gameId)
+    await deleteGameState(gameId)
+  }
+
+  // ---------- views ----------
+
+  viewFor(state: GameState, userId: string | null, options: { isAdmin?: boolean; revealAll?: boolean; events?: GameEvent[] } = {}): GameView & { events: GameEvent[] } {
+    const view = buildView(state, { userId, isAdmin: options.isAdmin, revealAll: options.revealAll })
+    const events = options.events ? maskEvents(options.events, view.viewerPlayerId, !!options.isAdmin) : []
+    return { ...view, events }
+  }
+
+  private requireHost(state: GameState, actor: ActorContext) {
+    if (actor.isAdmin) return
+    if (state.hostId !== actor.userId) throw new EngineError('forbidden', 'Only the host can do that')
   }
 }
 
-// Singleton instance
-// Use globalThis to persist state across HMR reloads in development
-const globalGameManager = globalThis as unknown as { gameManager: GameManager };
+// Singleton persisted across HMR reloads in development.
+const globalRef = globalThis as unknown as { __mahjongGameManager?: GameManager }
+if (!globalRef.__mahjongGameManager) globalRef.__mahjongGameManager = new GameManager()
 
-if (!globalGameManager.gameManager) {
-  globalGameManager.gameManager = new GameManager();
-}
-
-export const gameManager = globalGameManager.gameManager;
+export const gameManager = globalRef.__mahjongGameManager
+export { EngineError }

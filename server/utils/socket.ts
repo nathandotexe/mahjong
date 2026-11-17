@@ -3,502 +3,251 @@ import { Server as SocketIOServer } from 'socket.io'
 import type { Socket } from 'socket.io'
 import { createAdapter } from '@socket.io/redis-adapter'
 import { createClient } from 'redis'
-import { getMongoClient } from './mongo'
-import type { SocketConnection, RoomState } from '../types/database'
-import { gameManager } from './gameManager'
-import { ActionType, GameEndReason } from '../types/game'
-import { AuthService } from '../services/authService'
-import { UserService } from '../services/userService'
+import { gameManager, EngineError } from './gameManager'
+import { resolveUserFromCookieHeader } from './session'
+import { GamePhase, type ActionType, type GameEvent, type GameState, type RuleConfig, type TileSuit } from '../../shared/types/game'
+import type { User } from '../types/database'
 
 let io: SocketIOServer | null = null
 
-export interface SocketUser {
-  socketId: string
-  userId: string
-  userName: string
-  roomId?: string
+interface SocketData {
+  user: User | null
+  gameId: string | null
+  revealAll: boolean
 }
 
-function parseCookies(header?: string) {
-  const result: Record<string, string> = {}
-  if (!header) return result
+type Ack = (response: { ok: boolean; error?: string; code?: string; data?: unknown }) => void
 
-  for (const part of header.split(';')) {
-    const [rawKey, ...rest] = part.trim().split('=')
-    if (!rawKey) continue
-    const key = decodeURIComponent(rawKey)
-    const value = decodeURIComponent(rest.join('=') || '')
-    result[key] = value
-  }
-
-  return result
+function errorPayload(error: unknown) {
+  if (error instanceof EngineError) return { ok: false as const, error: error.message, code: error.code }
+  const message = error instanceof Error ? error.message : 'Unexpected error'
+  return { ok: false as const, error: message, code: 'error' }
 }
 
-async function socketIsAdmin(socket: Socket): Promise<boolean> {
-  const cookies = parseCookies(socket.handshake.headers.cookie)
-
-  if (cookies.mahjong_session) {
-    const userId = await AuthService.validateSession(cookies.mahjong_session)
-    if (userId) {
-      const user = await UserService.getUserById(userId)
-      if (user) {
-        return !!user.isAdmin
-      }
-    }
+async function emitStateToRoom(state: GameState, events: GameEvent[]) {
+  if (!io) return
+  const sockets = await io.in(state.gameId).fetchSockets()
+  for (const remote of sockets) {
+    const data = remote.data as SocketData
+    const user = data.user
+    const view = gameManager.viewFor(state, user?.userId ?? null, {
+      isAdmin: !!user?.isAdmin,
+      revealAll: data.revealAll,
+      events
+    })
+    remote.emit('game:state', view)
   }
-
-  if (cookies.user_id) {
-    const user = await UserService.getUserById(cookies.user_id)
-    if (user) {
-      return !!user.isAdmin
-    }
-  }
-
-  if (cookies.is_admin) {
-    return cookies.is_admin === 'true'
-  }
-
-  return false
-}
-
-// ✅ MongoDB Collections
-async function getSocketConnectionsCollection() {
-  const client = await getMongoClient()
-  const db = client.db(process.env.MONGODB_DB || 'blood_on_mahjong')
-  return db.collection<SocketConnection>('socketConnections')
-}
-
-async function getRoomStatesCollection() {
-  const client = await getMongoClient()
-  const db = client.db(process.env.MONGODB_DB || 'blood_on_mahjong')
-  return db.collection<RoomState>('roomStates')
 }
 
 export async function initializeSocketIO(server: HTTPServer) {
   if (io) return io
 
   io = new SocketIOServer(server, {
-    cors: {
-      origin: (origin, callback) => {
-        // Allow all origins in development/testing
-        callback(null, true)
-      },
-      methods: ['GET', 'POST'],
-      credentials: true
-    },
+    cors: { origin: (_origin, callback) => callback(null, true), methods: ['GET', 'POST'], credentials: true },
     transports: ['websocket', 'polling']
   })
 
-  // ✅ Configure Redis adapter for horizontal scaling
-  const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379'
-  
-  try {
-    const pubClient = createClient({ url: redisUrl })
-    const subClient = pubClient.duplicate()
-
-    await Promise.all([
-      pubClient.connect(),
-      subClient.connect()
-    ])
-
-    io.adapter(createAdapter(pubClient, subClient))
-    console.log('✅ Socket.IO Redis adapter connected')
-  } catch (error) {
-    console.warn('⚠️  Redis not available, running in single-server mode')
-    console.warn('   Set REDIS_URL environment variable to enable scaling')
+  // Redis adapter for horizontal scaling (optional).
+  const redisUrl = process.env.REDIS_URL
+  if (redisUrl) {
+    try {
+      const pubClient = createClient({ url: redisUrl })
+      const subClient = pubClient.duplicate()
+      pubClient.on('error', () => {})
+      subClient.on('error', () => {})
+      await Promise.all([pubClient.connect(), subClient.connect()])
+      io.adapter(createAdapter(pubClient, subClient))
+      console.log('✅ Socket.IO Redis adapter connected')
+    } catch {
+      console.warn('⚠️  Redis not reachable, running Socket.IO in single-server mode')
+    }
   }
 
+  gameManager.setBroadcaster(emitStateToRoom)
+
+  // Resolve the session user once per connection from the cookie header.
+  io.use(async (socket, next) => {
+    try {
+      const user = await resolveUserFromCookieHeader(socket.handshake.headers.cookie)
+      const data = socket.data as SocketData
+      data.user = user
+      data.gameId = null
+      data.revealAll = false
+      next()
+    } catch (error) {
+      next(error as Error)
+    }
+  })
+
   io.on('connection', (socket: Socket) => {
-    console.log(`🔌 Client connected: ${socket.id}`)
+    const data = socket.data as SocketData
 
-    // Set up GameManager broadcasting
-    gameManager.setWebSocketManager({
-      broadcast: (gameId: string, event: string, data: any) => {
-        // Map gameId to roomId (assuming they are the same for now, or we need a lookup)
-        // In GameManager.createGame, gameId is randomUUID.
-        // In GameService.createGame, gameId is randomUUID, roomId is passed.
-        // But GameManager is in-memory and uses gameId as the key.
-        // The frontend uses gameId as roomId in the URL usually.
-        // Let's assume gameId == roomId for broadcasting purposes in this context
-        emitToRoom(gameId, 'game:state-changed', data)
+    const requireUser = (ack?: Ack): User | null => {
+      if (!data.user) {
+        ack?.({ ok: false, error: 'Please sign in first', code: 'unauthenticated' })
+        return null
       }
-    })
+      return data.user
+    }
 
-    // Handle user authentication
-    socket.on('auth:login', async (data: { userId: string; userName: string }) => {
-      try {
-        const collection = await getSocketConnectionsCollection()
-        
-        // Store connection in MongoDB
-        await collection.insertOne({
-          socketId: socket.id,
-          userId: data.userId,
-          userName: data.userName,
-          connectedAt: new Date(),
-          lastSeenAt: new Date()
-        })
-        
-        socket.emit('auth:success', { socketId: socket.id })
-        console.log(`✅ User authenticated: ${data.userName} (${data.userId})`)
-      } catch (error) {
-        console.error('Error in auth:login:', error)
-        socket.emit('auth:error', { message: 'Authentication failed' })
-      }
-    })
+    const sendView = async (gameId: string) => {
+      const state = await gameManager.getGame(gameId)
+      if (!state) return null
+      const view = gameManager.viewFor(state, data.user?.userId ?? null, { isAdmin: !!data.user?.isAdmin, revealAll: data.revealAll })
+      socket.emit('game:state', view)
+      return view
+    }
 
-    // Join a game room
-    socket.on('room:join', async (data: { roomId: string; userId: string; userName: string }) => {
-      const { roomId, userId, userName } = data
-      console.log(
-        '[room:join]',
-        'PID:', process.pid,
-        'roomId:', roomId,
-        'user:', userName,
-        'socket:', socket.id
-      )
-      
+    socket.on('room:join', async (payload: { code?: string; gameId?: string }, ack?: Ack) => {
       try {
-        const roomStates = await getRoomStatesCollection()
-        const connections = await getSocketConnectionsCollection()
-        
-        // Get or create room state
-        let roomState = await roomStates.findOne({ roomId })
-        
-        if (!roomState) {
-          // Create new room
-          await roomStates.insertOne({
-            roomId,
-            playerIds: [],
-            socketIds: [],
-            ownerId: userId,
-            maxPlayers: 4,
-            createdAt: new Date(),
-            updatedAt: new Date()
-          })
-          roomState = await roomStates.findOne({ roomId })
-        } else if (!roomState.ownerId) {
-          await roomStates.updateOne(
-            { roomId },
-            { $set: { ownerId: userId } }
-          )
-          roomState = await roomStates.findOne({ roomId })
-        }
-        
-        // Check if room is full
-        if (roomState!.socketIds.length >= 4) {
-          socket.emit('room:error', { message: 'Room is full (max 4 players)' })
+        const user = requireUser(ack)
+        if (!user) return
+        let state = payload?.gameId ? await gameManager.getGame(payload.gameId) : null
+        if (!state && payload?.code) state = await gameManager.getGameByCode(payload.code)
+        if (!state) {
+          ack?.({ ok: false, error: 'Room not found', code: 'game_not_found' })
           return
         }
-
-        // Join the Socket.IO room
-        await socket.join(roomId)
-        
-        // Update room state in MongoDB
-        await roomStates.updateOne(
-          { roomId },
-          {
-            $addToSet: { 
-              socketIds: socket.id,
-              playerIds: userId 
-            },
-            $set: { updatedAt: new Date() }
-          }
-        )
-        
-        // Update user's room assignment
-        await connections.updateOne(
-          { socketId: socket.id },
-          { 
-            $set: { 
-              roomId,
-              lastSeenAt: new Date() 
-            } 
-          }
-        )
-
-        // Get updated room state
-        const updatedRoom = await roomStates.findOne({ roomId })
-        
-        // Get all users in room
-        const roomUsers = await connections.find({
-          socketId: { $in: updatedRoom!.socketIds }
-        }).toArray()
-
-        const roomUsersList = roomUsers.map((u: any) => ({
-          userId: u.userId,
-          userName: u.userName,
-          socketId: u.socketId
-        }))
-
-        // Notify all users in room
-        io!.to(roomId).emit('room:user-joined', {
-          userId,
-          userName,
-          roomUsers: roomUsersList,
-          playerCount: updatedRoom!.socketIds.length
-        })
-
-        console.log(`👥 ${userName} joined room ${roomId} (${updatedRoom!.socketIds.length}/4 players)`)
-      } catch (error) {
-        console.error('Error in room:join:', error)
-        socket.emit('room:error', { message: 'Failed to join room' })
-      }
-    })
-
-    // Leave room
-    socket.on('room:leave', async (data: { roomId: string }) => {
-      await handleLeaveRoom(socket, data.roomId)
-    })
-
-    // Game state updates
-    socket.on('game:action', async (data: any) => {
-      try {
-        const { gameId, playerId, type, tileId, tileIds } = data
-        
-        console.log(`🎮 Action received: ${type} from ${playerId} in game ${gameId}`)
-
-        if (type === ActionType.CHEAT_HU) {
-          const isAdmin = await socketIsAdmin(socket)
-          if (!isAdmin) {
-            socket.emit('game:error', { message: 'Admin privileges required' })
-            return
-          }
+        const seated = state.players.some(p => p.userId === user.userId)
+        if (!seated && state.phase === GamePhase.WAITING) {
+          await gameManager.join(state.gameId, { userId: user.userId, name: user.name, avatar: user.avatar ?? null })
         }
-        
-        // Execute action in GameManager (the brain)
-        // This will validate the move, update state, and trigger broadcast via setWebSocketManager
-        await gameManager.executeAction(gameId, playerId, type, tileId, tileIds)
-        
-      } catch (error: any) {
-        console.error('Error in game:action:', error.message)
-        socket.emit('game:error', { message: error.message })
-      }
-    })
-
-    // Game state sync (broadcast to all including sender)
-    socket.on('game:state-update', async (data: any) => {
-      try {
-        const connections = await getSocketConnectionsCollection()
-        const user = await connections.findOne({ socketId: socket.id })
-        
-        if (!user || !user.roomId) return
-
-        io!.to(user.roomId).emit('game:state-changed', data)
+        if (data.gameId && data.gameId !== state.gameId) {
+          await socket.leave(data.gameId)
+        }
+        await socket.join(state.gameId)
+        data.gameId = state.gameId
+        const nowSeated = (await gameManager.getGame(state.gameId))?.players.some(p => p.userId === user.userId)
+        if (nowSeated) await gameManager.setConnected(state.gameId, user.userId, true)
+        const view = await sendView(state.gameId)
+        ack?.({ ok: true, data: { gameId: state.gameId, code: state.code, spectator: !nowSeated, view } })
       } catch (error) {
-        console.error('Error in game:state-update:', error)
+        ack?.(errorPayload(error))
       }
     })
 
-    // Chat messages
-    socket.on('chat:message', async (data: { message: string }) => {
+    socket.on('game:sync', async (_payload: unknown, ack?: Ack) => {
+      if (!data.gameId) return ack?.({ ok: false, error: 'Not in a room', code: 'no_room' })
+      const view = await sendView(data.gameId)
+      ack?.({ ok: !!view, data: view })
+    })
+
+    socket.on('game:action', async (payload: { type: ActionType; tileId?: string; tileIds?: string[]; suit?: TileSuit; asPlayerId?: string }, ack?: Ack) => {
       try {
-        const connections = await getSocketConnectionsCollection()
-        const user = await connections.findOne({ socketId: socket.id })
-        
-        if (!user || !user.roomId) return
-
-        io!.to(user.roomId).emit('chat:message-received', {
-          userId: user.userId,
-          userName: user.userName,
-          message: data.message,
-          timestamp: Date.now()
-        })
+        const user = requireUser(ack)
+        if (!user || !data.gameId) return ack?.({ ok: false, error: 'Not in a room', code: 'no_room' })
+        await gameManager.act(
+          data.gameId,
+          { userId: user.userId, isAdmin: !!user.isAdmin, asPlayerId: user.isAdmin ? payload.asPlayerId : undefined },
+          payload.type,
+          { tileId: payload.tileId, tileIds: payload.tileIds, suit: payload.suit }
+        )
+        ack?.({ ok: true })
       } catch (error) {
-        console.error('Error in chat:message:', error)
+        ack?.(errorPayload(error))
       }
     })
 
-    // Player ready status
-    socket.on('player:ready', async (data: { isReady: boolean }) => {
+    socket.on('room:start', async (_payload: unknown, ack?: Ack) => {
       try {
-        const connections = await getSocketConnectionsCollection()
-        const user = await connections.findOne({ socketId: socket.id })
-        
-        if (!user || !user.roomId) return
-
-        io!.to(user.roomId).emit('player:ready-changed', {
-          userId: user.userId,
-          userName: user.userName,
-          isReady: data.isReady
-        })
+        const user = requireUser(ack)
+        if (!user || !data.gameId) return ack?.({ ok: false, error: 'Not in a room', code: 'no_room' })
+        await gameManager.startHand(data.gameId, { userId: user.userId, isAdmin: !!user.isAdmin })
+        ack?.({ ok: true })
       } catch (error) {
-        console.error('Error in player:ready:', error)
+        ack?.(errorPayload(error))
       }
     })
 
-    // Disconnect
+    socket.on('room:rules', async (payload: Partial<RuleConfig>, ack?: Ack) => {
+      try {
+        const user = requireUser(ack)
+        if (!user || !data.gameId) return ack?.({ ok: false, error: 'Not in a room', code: 'no_room' })
+        await gameManager.updateRules(data.gameId, { userId: user.userId, isAdmin: !!user.isAdmin }, payload ?? {})
+        ack?.({ ok: true })
+      } catch (error) {
+        ack?.(errorPayload(error))
+      }
+    })
+
+    socket.on('room:add-bot', async (_payload: unknown, ack?: Ack) => {
+      try {
+        const user = requireUser(ack)
+        if (!user || !data.gameId) return ack?.({ ok: false, error: 'Not in a room', code: 'no_room' })
+        await gameManager.addBot(data.gameId, { userId: user.userId, isAdmin: !!user.isAdmin })
+        ack?.({ ok: true })
+      } catch (error) {
+        ack?.(errorPayload(error))
+      }
+    })
+
+    socket.on('room:kick', async (payload: { playerId: string }, ack?: Ack) => {
+      try {
+        const user = requireUser(ack)
+        if (!user || !data.gameId) return ack?.({ ok: false, error: 'Not in a room', code: 'no_room' })
+        await gameManager.kick(data.gameId, { userId: user.userId, isAdmin: !!user.isAdmin }, payload.playerId)
+        ack?.({ ok: true })
+      } catch (error) {
+        ack?.(errorPayload(error))
+      }
+    })
+
+    socket.on('room:leave', async (_payload: unknown, ack?: Ack) => {
+      try {
+        const gameId = data.gameId
+        const user = data.user
+        if (gameId && user) {
+          await gameManager.leave(gameId, user.userId).catch(() => {})
+          await socket.leave(gameId)
+        }
+        data.gameId = null
+        ack?.({ ok: true })
+      } catch (error) {
+        ack?.(errorPayload(error))
+      }
+    })
+
+    socket.on('admin:reveal', async (payload: { on: boolean }, ack?: Ack) => {
+      if (!data.user?.isAdmin) return ack?.({ ok: false, error: 'Admin privileges required', code: 'forbidden' })
+      data.revealAll = !!payload?.on
+      if (data.gameId) await sendView(data.gameId)
+      ack?.({ ok: true })
+    })
+
+    // Chat travels as a `chat` game event, delivered with the next state broadcast.
+    const relayChat = (kind: 'message' | 'emote', text: string) => {
+      const user = data.user
+      if (!user || !data.gameId) return
+      gameManager.chat(data.gameId, { userId: user.userId, name: user.name }, kind, text).catch(error => {
+        console.error('[chat] failed:', error)
+      })
+    }
+
+    socket.on('chat:message', (payload: { text: string }) => relayChat('message', String(payload?.text ?? '')))
+    socket.on('chat:emote', (payload: { emote: string }) => relayChat('emote', String(payload?.emote ?? '')))
+
     socket.on('disconnect', async () => {
       try {
-        const connections = await getSocketConnectionsCollection()
-        const user = await connections.findOne({ socketId: socket.id })
-        
-        if (user && user.roomId) {
-          await handleLeaveRoom(socket, user.roomId)
+        if (data.gameId && data.user) {
+          // Only mark away if this user has no other socket left in the room.
+          const sockets = await io!.in(data.gameId).fetchSockets()
+          const stillHere = sockets.some(s => (s.data as SocketData).user?.userId === data.user!.userId && s.id !== socket.id)
+          if (!stillHere) await gameManager.setConnected(data.gameId, data.user.userId, false)
         }
-
-        // Remove connection from MongoDB
-        await connections.deleteOne({ socketId: socket.id })
-        console.log(`❌ Client disconnected: ${socket.id}`)
       } catch (error) {
-        console.error('Error in disconnect:', error)
+        console.error('Error on disconnect:', error)
       }
     })
   })
 
-  console.log('🚀 Socket.IO initialized with MongoDB state storage')
+  console.log('🚀 Socket.IO initialized')
   return io
-}
-
-async function handleLeaveRoom(socket: Socket, roomId: string) {
-  try {
-    const connections = await getSocketConnectionsCollection()
-    const roomStates = await getRoomStatesCollection()
-    
-    const user = await connections.findOne({ socketId: socket.id })
-    
-    // Remove from Socket.IO room
-    socket.leave(roomId)
-    
-    // Update room state in MongoDB
-    await roomStates.updateOne(
-      { roomId },
-      {
-        $pull: { 
-          socketIds: socket.id,
-          playerIds: user?.userId 
-        },
-        $set: { updatedAt: new Date() }
-      }
-    )
-    
-    // Clear user's room assignment
-    await connections.updateOne(
-      { socketId: socket.id },
-      { 
-        $unset: { roomId: '' },
-        $set: { lastSeenAt: new Date() }
-      }
-    )
-
-    // Get updated room state
-    const updatedRoom = await roomStates.findOne({ roomId })
-    
-        if (updatedRoom) {
-          const ownerLeft = updatedRoom.ownerId && user?.userId === updatedRoom.ownerId
-
-          if (ownerLeft) {
-            const remainingSocketIds = updatedRoom.socketIds.filter((id: string) => id !== socket.id)
-
-            io!.to(roomId).emit('room:dismissed', {
-              reason: GameEndReason.OWNER_LEFT,
-              message: 'Room closed by host'
-            })
-
-            if (remainingSocketIds.length > 0) {
-              await connections.updateMany(
-                { socketId: { $in: remainingSocketIds } },
-                { $unset: { roomId: '' }, $set: { lastSeenAt: new Date() } }
-              )
-
-              for (const sid of remainingSocketIds) {
-                const peer = io!.sockets.sockets.get(sid)
-                peer?.leave(roomId)
-              }
-            }
-
-            try {
-              await gameManager.endGameForEmptyRoom(roomId, GameEndReason.OWNER_LEFT)
-            } catch (error) {
-              console.error('Failed to end game after owner left:', error)
-            }
-
-            await roomStates.deleteOne({ roomId })
-            return
-          }
-
-      // Get remaining users
-      const roomUsers = await connections.find({
-        socketId: { $in: updatedRoom.socketIds }
-      }).toArray()
-
-      const roomUsersList = roomUsers.map((u: any) => ({
-        userId: u.userId,
-        userName: u.userName,
-        socketId: u.socketId
-      }))
-
-      // Notify others
-      if (user) {
-        io!.to(roomId).emit('room:user-left', {
-          userId: user.userId,
-          userName: user.userName,
-          roomUsers: roomUsersList,
-          playerCount: updatedRoom.socketIds.length
-        })
-
-        console.log(`👋 ${user.userName} left room ${roomId} (${updatedRoom.socketIds.length}/4 players)`)
-      }
-
-      // Clean up empty room
-      if (updatedRoom.socketIds.length === 0) {
-        try {
-          await gameManager.endGameForEmptyRoom(roomId)
-        } catch (error) {
-          console.error('Failed to mark game ended for empty room:', error)
-        }
-        console.log(`[room:cleanup] Room ${roomId} empty; deleting state document`)
-        await roomStates.deleteOne({ roomId })
-      }
-    }
-  } catch (error) {
-    console.error('Error in handleLeaveRoom:', error)
-  }
 }
 
 export function getIO(): SocketIOServer | null {
   return io
 }
 
-// Helper to emit to specific room
-export function emitToRoom(roomId: string, event: string, data: any) {
-  if (io) {
-    io.to(roomId).emit(event, data)
-  }
-}
-
-// Helper to get room users from MongoDB
-export async function getRoomUsers(roomId: string): Promise<SocketUser[]> {
-  try {
-    const roomStates = await getRoomStatesCollection()
-    const connections = await getSocketConnectionsCollection()
-    
-    const room = await roomStates.findOne({ roomId })
-    if (!room) return []
-
-    const users = await connections.find({
-      socketId: { $in: room.socketIds }
-    }).toArray()
-
-    return users.map((u: any) => ({
-      socketId: u.socketId,
-      userId: u.userId,
-      userName: u.userName,
-      roomId: u.roomId
-    }))
-  } catch (error) {
-    console.error('Error in getRoomUsers:', error)
-    return []
-  }
-}
-
-// Helper to get user count in room from MongoDB
-export async function getRoomUserCount(roomId: string): Promise<number> {
-  try {
-    const roomStates = await getRoomStatesCollection()
-    const room = await roomStates.findOne({ roomId })
-    return room ? room.socketIds.length : 0
-  } catch (error) {
-    console.error('Error in getRoomUserCount:', error)
-    return 0
-  }
+export function emitToRoom(roomId: string, event: string, data: unknown) {
+  io?.to(roomId).emit(event, data)
 }

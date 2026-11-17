@@ -1,20 +1,11 @@
-import { AuthService } from '../../services/authService';
+import { AuthService } from '../../services/authService'
+import { SESSION_COOKIE, clearSessionCookies } from '../../utils/session'
 
-/**
- * Logout endpoint
- */
 export default defineEventHandler(async (event) => {
-  const token = getCookie(event, 'mahjong_session');
-
+  const token = getCookie(event, SESSION_COOKIE)
   if (token) {
-    await AuthService.deleteSession(token);
+    await AuthService.deleteSession(token)
   }
-
-  // Clear cookie
-  deleteCookie(event, 'mahjong_session');
-
-  return {
-    success: true,
-    message: 'Logged out successfully'
-  };
-});
+  clearSessionCookies(event)
+  return { success: true, message: 'Logged out successfully' }
+})

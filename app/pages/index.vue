@@ -1,494 +1,210 @@
-<!-- app/pages/index.vue -->
 <template>
-  <div class="mahjong-page">
-    <div class="mahjong-card">
-      <h1 class="mahjong-title">Waiting Room</h1>
-      <p class="mahjong-subtitle">
-        Welcome back, {{ userName || 'Player' }}.
-        <span v-if="isAdminUser" class="admin-badge">(Admin Mode)</span>
-      </p>
-
-      <div class="mahjong-actions">
-        <button
-          class="mahjong-button primary"
-          :disabled="isCreatingGame"
-          @click="startNewGame"
-        >
-          New Game
-        </button>
-
-        <button
-          v-if="isAdminUser"
-          class="mahjong-button secondary"
-          @click="goToAdminSandbox"
-        >
-          Admin Sandbox
-        </button>
-
-        <button class="mahjong-button secondary" @click="onJoinGame">
-          Join Game
-        </button>
-
-        <button class="mahjong-button secondary" @click="onMatchHistory">
-          Match History
-        </button>
-
-        <button class="mahjong-button secondary" @click="openProfileModal">
-          User Profile
-        </button>
-
-        <button class="mahjong-button danger" @click="logout">
-          Log Out
-        </button>
-      </div>
-
-      <p class="mahjong-hint">
-        New Game will temporarily send you to room <strong>#66666</strong>.
-      </p>
-    </div>
-
-    <!-- Proper Nuxt UI v4 modal usage -->
-    <UModal
-      v-model:open="isProfileModalOpen"
-      title="Player Profile"
-      description="Share your details so friends know who is at the table."
-      :close="{
-        color: 'neutral',
-        variant: 'ghost',
-        class: 'profile-close-btn'
-      }"
-    >
-      <template #body>
-        <div class="profile-modal-shell">
-          <div v-if="profileError">
-            <UAlert color="red" variant="soft" icon="i-heroicons-exclamation-triangle">
-              {{ profileError?.data?.message || profileError?.message || 'Unable to load your profile.' }}
-            </UAlert>
-            <div class="profile-actions">
-              <UButton color="emerald" variant="solid" @click="refreshProfile">
-                Retry
-              </UButton>
-            </div>
+  <div class="mj-page lobby">
+    <div class="lobby-grid">
+      <section class="mj-card hero">
+        <div class="hero-head">
+          <div>
+            <h1 class="mj-title">Waiting Room</h1>
+            <p class="mj-subtitle">
+              Welcome back, <b>{{ session.user.value?.name || 'Player' }}</b>
+              <span v-if="session.isAdmin.value" class="mj-chip gold">admin</span>
+            </p>
           </div>
-          <div v-else>
-            <div v-if="profilePending && !profileHasLoaded" class="profile-skeletons">
-              <USkeleton
-                class="skeleton-row"
-                v-for="i in 3"
-                :key="i"
-                height="48px"
-                :ui="{ rounded: 'rounded-lg' }"
-              />
-            </div>
-
-            <UForm
-              v-else
-              :state="profileForm"
-              class="profile-form"
-              @submit.prevent="saveProfile"
-            >
-              <div class="profile-grid">
-                <UFormField label="Full Name" name="name" required>
-                  <UInput
-                    v-model="profileForm.name"
-                    :disabled="!isEditingProfile || profileSaving"
-                    placeholder="Enter your name"
-                  />
-                </UFormField>
-
-                <UFormField label="Date of Birth" name="dateOfBirth">
-                  <UInput
-                    v-model="profileForm.dateOfBirth"
-                    type="date"
-                    :disabled="!isEditingProfile || profileSaving"
-                  />
-                </UFormField>
-
-                <UFormField label="Gender" name="gender">
-                  <UInput
-                    v-model="profileForm.gender"
-                    :disabled="!isEditingProfile || profileSaving"
-                    placeholder="Enter gender"
-                  />
-                </UFormField>
-
-                <UFormField label="Address" name="address" class="profile-full-row">
-                  <UTextarea
-                    v-model="profileForm.address"
-                    :disabled="!isEditingProfile || profileSaving"
-                    placeholder="City, Country"
-                    :rows="3"
-                  />
-                </UFormField>
-              </div>
-
-              <UAlert
-                v-if="profileStatus.message"
-                :color="profileStatus.type === 'error' ? 'red' : 'emerald'"
-                :variant="profileStatus.type === 'error' ? 'soft' : 'subtle'"
-                icon="i-heroicons-information-circle"
-              >
-                {{ profileStatus.message }}
-              </UAlert>
-
-              <div class="profile-actions">
-                <UButton
-                  v-if="!isEditingProfile"
-                  color="emerald"
-                  icon="i-heroicons-pencil-square"
-                  @click="startEditingProfile"
-                  :disabled="profilePending || !profileHasLoaded"
-                >
-                  Edit Profile
-                </UButton>
-
-                <template v-else>
-                  <UButton
-                    type="submit"
-                    color="emerald"
-                    icon="i-heroicons-check"
-                    :loading="profileSaving"
-                  >
-                    Save
-                  </UButton>
-                  <UButton
-                    type="button"
-                    color="gray"
-                    variant="ghost"
-                    icon="i-heroicons-x-mark"
-                    @click="cancelEditingProfile"
-                    :disabled="profileSaving"
-                  >
-                    Cancel
-                  </UButton>
-                </template>
-              </div>
-            </UForm>
-          </div>
+          <button class="mj-btn ghost small" @click="logout">Log out</button>
         </div>
-      </template>
-    </UModal>
+
+        <div v-if="liveGame" class="rejoin">
+          <div>
+            <b>You have a table in progress</b>
+            <p>Room {{ liveGame.code }} · {{ liveGame.playerCount }} players · {{ phaseLabel(liveGame.phase) }}</p>
+          </div>
+          <NuxtLink :to="`/room/${liveGame.code}`" class="mj-btn gold">Rejoin</NuxtLink>
+        </div>
+
+        <div class="actions">
+          <button class="mj-btn primary big" :disabled="creating" @click="createTable">
+            {{ creating ? 'Creating…' : 'New table' }}
+            <small>Get a code to share</small>
+          </button>
+          <form class="join" @submit.prevent="joinByCode">
+            <input v-model="joinCode" class="mj-input code" maxlength="8" placeholder="ROOM CODE" autocapitalize="characters" spellcheck="false" />
+            <button class="mj-btn" type="submit" :disabled="joining || joinCode.replace(/[^a-z0-9]/gi, '').length < 4">{{ joining ? 'Joining…' : 'Join' }}</button>
+          </form>
+          <p v-if="error" class="mj-error">{{ error }}</p>
+        </div>
+
+        <details class="quick-rules">
+          <summary>Table rules for new tables</summary>
+          <RoomSettings :rules="newRules" :editable="true" @update="p => Object.assign(newRules, p)" />
+        </details>
+
+        <div class="links">
+          <NuxtLink to="/history" class="mj-btn">Match history</NuxtLink>
+          <button class="mj-btn" @click="editingName = !editingName">Change name</button>
+        </div>
+        <form v-if="editingName" class="rename" @submit.prevent="saveName">
+          <input v-model="newName" class="mj-input" maxlength="24" placeholder="New display name" />
+          <button class="mj-btn primary" type="submit" :disabled="!newName.trim()">Save</button>
+        </form>
+      </section>
+
+      <section class="mj-card tables">
+        <div class="tables-head">
+          <h2>Open tables</h2>
+          <button class="mj-btn small ghost" :disabled="loadingTables" @click="loadTables">{{ loadingTables ? '…' : 'Refresh' }}</button>
+        </div>
+        <p v-if="!tables.length && !loadingTables" class="empty">No open tables right now. Start one and share the code.</p>
+        <ul v-else class="table-list">
+          <li v-for="t in tables" :key="t.gameId">
+            <div class="t-main">
+              <span class="t-code">{{ t.code }}</span>
+              <span class="t-meta">{{ t.playerCount }}/4 · host {{ t.hostName || '?' }}</span>
+              <span class="t-rules">
+                <span class="mj-chip muted">{{ t.rules.preset === 'mil' ? 'MIL' : 'Standard' }}</span>
+                <span class="mj-chip muted">cap {{ t.rules.fanCap || '∞' }}</span>
+                <span v-if="t.rules.exchangeThree" class="mj-chip muted">Swap three</span>
+                <span v-if="t.rules.bloodRiver" class="mj-chip red">Blood River</span>
+              </span>
+            </div>
+            <NuxtLink :to="`/room/${t.code}`" class="mj-btn small primary">Join</NuxtLink>
+          </li>
+        </ul>
+      </section>
+    </div>
   </div>
 </template>
 
-<script setup>
-const userName = useCookie('user_name')
-const isAdmin = useCookie('is_admin')
-const router = useRouter()
+<script setup lang="ts">
+import { DEFAULT_RULES, type RuleConfig } from '~/types/game'
 
-const isAdminUser = computed(() => isAdmin.value === 'true' || isAdmin.value === true)
-const isCreatingGame = ref(false)
+interface OpenTable { gameId: string; code: string; playerCount: number; hostName: string | null; rules: RuleConfig }
 
-const { data: profileResponse, pending: profilePending, error: profileError, refresh: refreshProfile } =
-  await useFetch('/api/profile', {
-    method: 'GET',
-    cache: 'no-cache'
-  })
+const session = useSession()
+const creating = ref(false)
+const joining = ref(false)
+const joinCode = ref('')
+const error = ref('')
+const tables = ref<OpenTable[]>([])
+const loadingTables = ref(false)
+const liveGame = ref<{ code: string; phase: string; playerCount: number } | null>(null)
+const newRules = reactive<RuleConfig>({ ...DEFAULT_RULES })
+const editingName = ref(false)
+const newName = ref('')
 
-const profileForm = reactive({
-  name: '',
-  address: '',
-  dateOfBirth: '',
-  gender: ''
-})
+useHead({ title: 'Blood on Mahjong' })
 
-const isEditingProfile = ref(false)
-const profileSaving = ref(false)
-const profileStatus = ref({ type: '', message: '' })
-const isProfileModalOpen = ref(false)
-
-const profileHasLoaded = computed(() => Boolean(profileResponse.value?.data))
-
-const hydrateProfileForm = (payload) => {
-  if (!payload) return
-  profileForm.name = payload.name || ''
-  profileForm.address = payload.address || ''
-  profileForm.dateOfBirth = payload.dateOfBirth || ''
-  profileForm.gender = payload.gender || ''
-}
-
-watch(
-  () => profileResponse.value?.data,
-  (data) => {
-    if (data) {
-      hydrateProfileForm(data)
-    }
-  },
-  { immediate: true }
-)
-
-const setProfileStatus = (type, message) => {
-  profileStatus.value = { type, message }
-}
-
-const ensureProfileLoaded = async () => {
-  const isLoaded = profileHasLoaded.value
-  const isLoading = profilePending.value
-
-  if (!isLoaded && !isLoading) {
-    await refreshProfile()
-  }
-}
-
-const openProfileModal = async () => {
-  setProfileStatus('', '')
-  await ensureProfileLoaded()
-  isProfileModalOpen.value = true
-}
-
-const startEditingProfile = () => {
-  if (!profileHasLoaded.value) return
-  isEditingProfile.value = true
-  setProfileStatus('', '')
-}
-
-const cancelEditingProfile = () => {
-  hydrateProfileForm(profileResponse.value?.data)
-  isEditingProfile.value = false
-  setProfileStatus('', '')
-}
-
-watch(isProfileModalOpen, (isOpen, wasOpen) => {
-  if (!isOpen && wasOpen) {
-    // when modal closes, reset form + editing state
-    cancelEditingProfile()
-  }
-})
-
-const saveProfile = async () => {
-  if (!isEditingProfile.value || profileSaving.value) return
-
-  if (!profileForm.name.trim()) {
-    setProfileStatus('error', 'Name is required.')
+onMounted(async () => {
+  const user = await session.ensure()
+  if (!user) {
+    navigateTo('/login')
     return
   }
-
-  profileSaving.value = true
-  setProfileStatus('', '')
-
+  newName.value = user.name
   try {
-    const response = await $fetch('/api/profile', {
-      method: 'PUT',
-      body: {
-        name: profileForm.name.trim(),
-        address: profileForm.address,
-        dateOfBirth: profileForm.dateOfBirth,
-        gender: profileForm.gender
-      },
-      headers: { 'Cache-Control': 'no-cache' }
-    })
+    const saved = window.localStorage.getItem('mj-new-rules')
+    if (saved) Object.assign(newRules, JSON.parse(saved))
+  } catch {
+    /* ignore */
+  }
+  loadTables()
+  try {
+    const mine = await $fetch<{ data: { code: string; phase: string; playerCount: number } | null }>('/api/game/mine')
+    liveGame.value = mine.data
+  } catch {
+    liveGame.value = null
+  }
+})
 
-    if (response?.data) {
-      profileResponse.value = response
-    } else {
-      await refreshProfile()
-    }
+watch(newRules, value => {
+  try {
+    window.localStorage.setItem('mj-new-rules', JSON.stringify(value))
+  } catch {
+    /* ignore */
+  }
+})
 
-    setProfileStatus('success', 'Profile updated successfully.')
-    isEditingProfile.value = false
-  } catch (error) {
-    setProfileStatus('error', error?.data?.message || error?.message || 'Failed to update profile.')
+const loadTables = async () => {
+  loadingTables.value = true
+  try {
+    const response = await $fetch<{ data: { games: OpenTable[] } }>('/api/game/waiting', { cache: 'no-cache' })
+    tables.value = response.data.games
+  } catch {
+    tables.value = []
   } finally {
-    profileSaving.value = false
+    loadingTables.value = false
   }
 }
 
-const startNewGame = async () => {
-  if (isCreatingGame.value) return
-  isCreatingGame.value = true
+const createTable = async () => {
+  if (creating.value) return
+  creating.value = true
+  error.value = ''
   try {
-    const response = await $fetch('/api/game/create', {
-      method: 'POST',
-      body: { playerName: userName.value || 'Player 1' },
-      headers: { 'Cache-Control': 'no-cache' }
-    })
-
-    if (response && response.success) {
-      const { gameId, playerId } = response.data || {}
-      return navigateTo(`/gameroom/${gameId}?playerId=${playerId}`)
-    }
-    console.error('Unexpected response creating game:', response)
-  } catch (e) {
-    console.error('Error creating game:', e)
+    const response = await $fetch<{ data: { code: string } }>('/api/game/create', { method: 'POST', body: { rules: newRules } })
+    await navigateTo(`/room/${response.data.code}`)
+  } catch (e: any) {
+    error.value = e?.data?.message || 'Could not create a table'
   } finally {
-    isCreatingGame.value = false
+    creating.value = false
   }
 }
 
-const onJoinGame = () => navigateTo('/join-game')
-const onMatchHistory = () => router.push('/history')
-const goToAdminSandbox = () => navigateTo('/admin-test')
-
-const logout = () => {
-  const token = useCookie('auth_token')
-  token.value = null
-  return navigateTo('/login')
+const joinByCode = async () => {
+  const code = joinCode.value.toUpperCase().replace(/[^A-Z0-9]/g, '')
+  if (code.length < 4) return
+  joining.value = true
+  error.value = ''
+  try {
+    const response = await $fetch<{ data: { code: string } }>('/api/game/join', { method: 'POST', body: { code } })
+    await navigateTo(`/room/${response.data.code}`)
+  } catch (e: any) {
+    error.value = e?.data?.message || 'No table with that code'
+  } finally {
+    joining.value = false
+  }
 }
+
+const saveName = async () => {
+  try {
+    await $fetch('/api/profile', { method: 'PUT', body: { name: newName.value.trim() } })
+    await session.refresh()
+    editingName.value = false
+  } catch (e: any) {
+    error.value = e?.data?.message || 'Could not save the name'
+  }
+}
+
+const logout = async () => {
+  await session.logout()
+  navigateTo('/login')
+}
+
+const phaseLabel = (phase: string) => ({ waiting: 'waiting to start', exchanging: 'swapping tiles', choosing_suit: 'choosing suits', playing: 'in play', ended: 'between hands' })[phase] ?? phase
 </script>
 
 <style scoped>
-.mahjong-page {
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: radial-gradient(circle at top, #153b2f, #07130e);
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  color: #f5f5f5;
-}
-
-.mahjong-card {
-  background: rgba(7, 19, 14, 0.9);
-  border-radius: 18px;
-  padding: 32px 40px;
-  width: 90%;
-  max-width: 520px;
-  text-align: center;
-  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.5);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  margin: 0 auto;
-}
-
-.admin-badge {
-  color: #ff6b6b;
-  font-size: 0.8em;
-}
-
-.mahjong-title {
-  font-size: 2rem;
-  margin-bottom: 4px;
-  letter-spacing: 0.06em;
-}
-
-.mahjong-subtitle {
-  font-size: 0.95rem;
-  opacity: 0.9;
-  margin-bottom: 24px;
-}
-
-.mahjong-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-
-.mahjong-button {
-  padding: 12px 24px;
-  border-radius: 999px;
-  border: none;
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 0.95rem;
-  transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
-}
-
-.mahjong-button.primary {
-  background: linear-gradient(135deg, #1f8a52, #46c574);
-  color: #03100a;
-  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
-}
-
-.mahjong-button.primary:hover {
-  transform: translateY(-1px);
-  filter: brightness(1.05);
-  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.45);
-}
-
-.mahjong-button.secondary {
-  background: rgba(22, 51, 40, 0.95);
-  color: #e0f2e9;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.mahjong-button.secondary:hover {
-  transform: translateY(-1px);
-  filter: brightness(1.04);
-}
-
-.mahjong-button.danger {
-  background: rgba(123, 26, 26, 0.9);
-  color: #ffdada;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-}
-
-.mahjong-button.danger:hover {
-  background: rgba(160, 38, 38, 1);
-  transform: translateY(-1px);
-}
-
-.mahjong-hint {
-  font-size: 0.85rem;
-  opacity: 0.85;
-}
-
-.profile-modal-shell {
-  width: min(560px, 100%);
-  margin: 0 auto;
-  padding: 0 8px 8px;
-  box-sizing: border-box;
-}
-
-.profile-close-btn {
-  border-radius: 999px;
-}
-
-.profile-form {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.profile-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.profile-full-row {
-  width: 100%;
-}
-
-.profile-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 12px;
-  margin-top: 12px;
-}
-
-.profile-skeletons {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.skeleton-row {
-  width: 100%;
-}
-
-@media (max-width: 600px) {
-  .mahjong-card {
-    padding: 24px 20px;
-  }
-
-  .mahjong-title {
-    font-size: 1.6rem;
-  }
-
-  .mahjong-button {
-    font-size: 0.85rem;
-    padding: 10px 18px;
-  }
-}
-
-@media (max-width: 400px) {
-  .mahjong-card {
-    padding: 20px 16px;
-  }
-
-  .mahjong-button {
-    font-size: 0.8rem;
-    padding: 8px 14px;
-  }
-}
+.lobby { align-items: flex-start; }
+.lobby-grid { width: 100%; max-width: 1080px; display: grid; gap: 16px; grid-template-columns: 1fr; }
+@media (min-width: 900px) { .lobby-grid { grid-template-columns: 1.1fr 0.9fr; } }
+.mj-card { max-width: none; }
+.hero-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.rejoin { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-radius: 14px; background: rgba(233, 196, 106, 0.12); border: 1px solid rgba(233, 196, 106, 0.4); margin-bottom: 16px; animation: mj-fade-up 0.3s ease; }
+.rejoin p { margin: 2px 0 0; color: var(--ink-dim); font-size: 0.85rem; }
+.actions { display: flex; flex-direction: column; gap: 12px; }
+.big { padding: 16px; font-size: 1.15rem; flex-direction: column; gap: 2px; border-radius: 16px; }
+.big small { font-size: 0.72rem; font-weight: 500; opacity: 0.8; }
+.join { display: flex; gap: 8px; }
+.quick-rules { margin-top: 18px; color: var(--ink-dim); font-size: 0.9rem; }
+.quick-rules summary { cursor: pointer; margin-bottom: 10px; }
+.links { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+.rename { display: flex; gap: 8px; margin-top: 10px; }
+.tables-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+h2 { margin: 0; font-size: 1.1rem; }
+.empty { color: var(--ink-faint); font-size: 0.9rem; }
+.table-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.table-list li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.04); border: 1px solid var(--panel-border); }
+.t-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.t-code { font-weight: 800; letter-spacing: 0.2em; color: var(--gold); }
+.t-meta { font-size: 0.82rem; color: var(--ink-dim); }
+.t-rules { display: flex; gap: 4px; flex-wrap: wrap; }
 </style>
