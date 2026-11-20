@@ -120,6 +120,11 @@
           <TurnTimer v-if="room.isMyTurn.value && room.secondsLeft.value !== null" :seconds="room.secondsLeft.value" :total="timerTotal" small />
         </div>
 
+        <div v-if="me.autoPlay && !me.isBot && view.phase !== 'ended'" class="autoplay-banner" role="status">
+          <span><strong>Auto-play is on.</strong> Your moves are being made for you.</span>
+          <button class="mj-btn primary small" :disabled="room.pendingAction.value" @click="resumeControl">I'm back</button>
+        </div>
+
         <DiscardRiver :tiles="me.hand.discardedTiles" :highlight-id="lastDiscardId" size="sm" />
 
         <ActionBar
@@ -249,6 +254,8 @@ const suggestExchange = () => {
 const chooseSuit = (suit: TileSuit) => room.act(ActionType.CHOOSE_SUIT, { suit })
 
 const doAct = (action: string) => room.act(action as ActionType)
+
+const resumeControl = () => room.act(ActionType.RESUME)
 
 // ---------- kongs ----------
 const kongChooser = ref<{ key: string; tile: Tile; run: () => void }[]>([])
@@ -385,6 +392,9 @@ const handleEvent = (event: GameEvent) => {
       break
     case 'timeout':
       if (event.playerId && event.label === 'turn') pushCallout(event.playerId, { text: 'Auto-play', kind: 'info' })
+      break
+    case 'player_resumed':
+      if (event.playerId) pushCallout(event.playerId, { text: 'Back', kind: 'info' })
       break
     case 'exchange_revealed': {
       const dir = String(event.payload?.direction ?? '')
@@ -527,6 +537,7 @@ const cls = (v: number) => (v > 0 ? 'score-pos' : v < 0 ? 'score-neg' : 'score-z
 .self-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .self-id { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .self-name { font-weight: 800; }
+.autoplay-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 8px 12px; border-radius: 12px; background: rgba(80, 140, 230, 0.18); border: 1px solid rgba(120, 170, 240, 0.5); font-size: 0.85rem; }
 .kong-chooser { display: flex; align-items: center; gap: 8px; justify-content: center; flex-wrap: wrap; font-size: 0.85rem; }
 .kong-option { border: 2px solid transparent; background: rgba(255, 255, 255, 0.08); border-radius: 10px; padding: 4px; cursor: pointer; }
 .kong-option:hover { border-color: var(--gold); }

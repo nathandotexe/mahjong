@@ -503,6 +503,22 @@ function beginPlay(state: GameState, ctx: EngineContext) {
   emit(state, ctx, { type: 'turn', playerId: dealer.id })
 }
 
+/**
+ * A player on auto-play (timed out, or was away) takes their seat back. Any phase; idempotent.
+ * If it is their turn, the short auto-play deadline is replaced by a full turn timer.
+ */
+export function resumeControl(state: GameState, player: Player, ctx: EngineContext) {
+  if (player.isBot) fail('forbidden', 'Bots cannot take control')
+  if (!player.autoPlay) return
+  player.autoPlay = false
+  player.connected = true
+  player.lastSeenAt = ctx.now
+  if (state.phase === GamePhase.PLAYING && !state.claimWindow && currentPlayer(state).id === player.id) {
+    setTurnDeadline(state, ctx, player)
+  }
+  emit(state, ctx, { type: 'player_resumed', playerId: player.id, label: player.name })
+}
+
 // ---------- actions ----------
 
 export interface ActionPayload {
@@ -519,6 +535,8 @@ export function act(state: GameState, playerId: string, action: ActionType, payl
       return submitExchange(state, playerId, payload.tileIds ?? [], ctx)
     case ActionType.CHOOSE_SUIT:
       return chooseSuit(state, playerId, payload.suit as TileSuit, ctx)
+    case ActionType.RESUME:
+      return resumeControl(state, player, ctx)
   }
 
   requirePhase(state, GamePhase.PLAYING)

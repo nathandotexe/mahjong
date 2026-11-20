@@ -304,6 +304,33 @@ describe('timers', () => {
     expect(dealer.autoPlay).toBe(true)
   })
 
+  it('lets a timed-out player take control back with a fresh turn timer', () => {
+    const table = makeTable({ seed: 41 })
+    const { state, ctx } = table
+    const dealer = state.players[state.dealerIndex]!
+    ctx.now = state.turnDeadline! + 1
+    engine.tick(state, ctx)
+    expect(dealer.autoPlay).toBe(true)
+
+    // Their next turn comes round on the short auto-play clock...
+    setTurn(table, state.dealerIndex)
+    state.turnDeadline = ctx.now + 1200
+    act(table, state.dealerIndex, ActionType.RESUME)
+    expect(dealer.autoPlay).toBe(false)
+    // ...and resuming restores the full 20 s turn.
+    expect(state.turnDeadline).toBe(ctx.now + 20_000)
+    expect(ctx.events.some(e => e.type === 'player_resumed' && e.playerId === dealer.id)).toBe(true)
+
+    // Resuming again is harmless.
+    expect(() => act(table, state.dealerIndex, ActionType.RESUME)).not.toThrow()
+  })
+
+  it('does not let a bot seat be resumed', () => {
+    const table = makeTable({ seed: 43, players: 3, start: false })
+    const bot = engine.seatBot(table.state, table.ctx)
+    expect(() => engine.act(table.state, bot.id, ActionType.RESUME, {}, table.ctx)).toThrow(/Bots/)
+  })
+
   it('auto-passes a claim window after the deadline', () => {
     const table = makeTable({ seed: 42 })
     const { state, ctx } = table

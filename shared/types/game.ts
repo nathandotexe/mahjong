@@ -140,7 +140,8 @@ export enum ActionType {
   PASS = 'pass',
   CHEAT_HU = 'cheat_hu',
   EXCHANGE_TILES = 'exchange_tiles',  // 
-  CHOOSE_SUIT = 'choose_suit'         // 
+  CHOOSE_SUIT = 'choose_suit',        // 
+  RESUME = 'resume'                   // take control back from auto-play
 }
 
 export interface GameAction {
@@ -379,6 +380,7 @@ export interface GameEvent {
     | 'player_left'
     | 'player_connected'
     | 'player_disconnected'
+    | 'player_resumed'
     | 'chat'
   playerId?: string
   targetPlayerId?: string
