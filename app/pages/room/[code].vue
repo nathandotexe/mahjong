@@ -11,6 +11,7 @@
       <div class="top-actions">
         <span v-if="!room.connected.value" class="mj-chip red">reconnecting…</span>
         <span v-else-if="room.spectator.value" class="mj-chip muted">spectating</span>
+        <NuxtLink to="/how-to-play" target="_blank" class="icon-btn" title="How to play (opens in a new tab)">❓</NuxtLink>
         <button class="icon-btn" :title="muted ? 'Unmute' : 'Mute'" @click="toggleMute">{{ muted ? '🔇' : '🔊' }}</button>
         <button class="icon-btn" title="Scores" @click="toggleDrawer('scores')">🏆</button>
         <button class="icon-btn" title="Chat" @click="toggleDrawer('chat')">
@@ -162,6 +163,7 @@ const copyInvite = async () => {
 .top-actions { display: flex; align-items: center; gap: 6px; }
 .icon-btn { position: relative; border: none; background: rgba(255, 255, 255, 0.07); color: var(--ink); width: 38px; height: 38px; border-radius: 10px; cursor: pointer; font-size: 1.05rem; }
 .icon-btn:hover { background: rgba(255, 255, 255, 0.14); }
+a.icon-btn { display: inline-grid; place-items: center; text-decoration: none; }
 .badge { position: absolute; top: -4px; right: -4px; background: var(--danger); color: #fff; font-size: 0.65rem; font-weight: 700; border-radius: 999px; padding: 1px 5px; }
 .room-main { flex: 1; padding: 12px; display: flex; flex-direction: column; }
 .centered { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--ink-dim); text-align: center; }

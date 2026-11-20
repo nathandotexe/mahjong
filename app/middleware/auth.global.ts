@@ -1,5 +1,5 @@
 export default defineNuxtRouteMiddleware((to) => {
-  if (to.path === '/login' || to.path.startsWith('/join/')) return
+  if (to.path === '/login' || to.path === '/how-to-play' || to.path.startsWith('/join/')) return
 
   // The marker cookie mirrors the httpOnly session cookie; the server still verifies every call.
   const marker = useCookie('auth_token').value

@@ -40,6 +40,7 @@
 
         <div class="links">
           <NuxtLink to="/history" class="mj-btn">Match history</NuxtLink>
+          <NuxtLink to="/how-to-play" class="mj-btn">How to play</NuxtLink>
           <button class="mj-btn" @click="editingName = !editingName">Change name</button>
         </div>
         <form v-if="editingName" class="rename" @submit.prevent="saveName">

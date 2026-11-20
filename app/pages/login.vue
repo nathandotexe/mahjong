@@ -9,6 +9,7 @@
         </div>
         <h1 class="mj-title">Blood on Mahjong</h1>
         <p class="mj-subtitle">Blood Battle · Sichuan mahjong with friends, in the browser.</p>
+        <NuxtLink to="/how-to-play" class="rules-link">New to Sichuan mahjong? Learn how to play →</NuxtLink>
       </div>
 
       <form class="guest" @submit.prevent="continueAsGuest">
@@ -138,6 +139,8 @@ const handleGoogle = async () => {
 .hero-tiles :deep(.tile:nth-child(3)) { transform: rotate(8deg); }
 .guest-row { display: flex; gap: 8px; }
 .hint { color: var(--ink-faint); font-size: 0.82rem; margin: 8px 0 0; }
+.rules-link { display: inline-block; margin-top: -6px; font-size: 0.85rem; color: var(--gold); text-decoration: none; }
+.rules-link:hover { text-decoration: underline; }
 .dev { margin-top: 18px; font-size: 0.85rem; color: var(--ink-dim); }
 .dev summary { cursor: pointer; }
 .dev-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
